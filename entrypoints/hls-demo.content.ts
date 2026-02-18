@@ -71,9 +71,7 @@ function setupDownloadReadyListener() {
     }) => {
       if (msg.type === "HLS_SAVE_RESULT" && msg.success && msg.mp4) {
         setButtonText("⬇ Download HLS (MP4)");
-        alert(
-          `Đã lưu và chuyển sang MP4: ${msg.mp4}\nThư mục: download/ trong project.`,
-        );
+        alert(`Đã lưu MP4: ${msg.mp4}\nThư mục: download/ trong project.`);
         return;
       }
       if (
@@ -94,7 +92,11 @@ function setupDownloadReadyListener() {
         downloadTotalChunks = msg.totalChunks;
         return;
       }
-      if (msg.type === "HLS_DOWNLOAD_CHUNK" && msg.buffer !== undefined && msg.index !== undefined) {
+      if (
+        msg.type === "HLS_DOWNLOAD_CHUNK" &&
+        msg.buffer !== undefined &&
+        msg.index !== undefined
+      ) {
         const buf = normalizeChunkBuffer(msg.buffer);
         if (buf && msg.index >= 0 && msg.index < downloadChunksByIndex.length) {
           downloadChunksByIndex[msg.index] = buf;

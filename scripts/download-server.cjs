@@ -1,24 +1,31 @@
 #!/usr/bin/env node
 /**
- * Server nhận video từ extension: lưu từng segment HLS vào 1 folder, gộp và convert sang MP4.
- * File .mp4 lưu ngang cấp với folder chứa segments. Folder segments được giữ lại.
+ * Server nhận video từ extension: gộp segments → 1 file .mp4, lưu vào thư mục download trong project.
+ * Không lưu lại các file segment (chỉ dùng tạm rồi xóa).
  *
  * Chạy: npm run download-server
+ * Thư mục lưu .mp4: download/ trong project. Có thể đổi bằng env DOWNLOAD_DIR.
  * API:
- *   POST /segment  body=bytes, header X-Session-Id, X-Index, X-Total  → lưu vào download/<sessionId>/segment_<index>.ts
- *   POST /finish   header X-Session-Id  → gộp + convert → download/<sessionId>.mp4
+ *   POST /segment  body=bytes, header X-Session-Id, X-Index, X-Total  → tạm lưu segment
+ *   POST /finish   header X-Session-Id  → gộp + convert → .mp4 vào download/, xóa folder segments
+ *   POST /save     body=.ts đã gộp  → convert → .mp4 vào download/ (fallback)
  */
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 const { spawn, execSync } = require("child_process");
 
 const PORT = 8765;
 const ROOT = path.join(__dirname, "..");
-const DOWNLOAD_DIR = path.join(ROOT, "download");
+const OUTPUT_DIR = process.env.DOWNLOAD_DIR || path.join(ROOT, "download");
+const TEMP_DIR = path.join(os.tmpdir(), "hls-extension-download");
 
-if (!fs.existsSync(DOWNLOAD_DIR)) {
-  fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
+if (!fs.existsSync(OUTPUT_DIR)) {
+  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+}
+if (!fs.existsSync(TEMP_DIR)) {
+  fs.mkdirSync(TEMP_DIR, { recursive: true });
 }
 
 const FFMPEG_CANDIDATES = [
@@ -139,7 +146,7 @@ const server = http.createServer((req, res) => {
       );
       return;
     }
-    const segmentDir = path.join(DOWNLOAD_DIR, sessionId);
+    const segmentDir = path.join(TEMP_DIR, sessionId);
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
@@ -181,8 +188,8 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ error: "Missing X-Session-Id" }));
       return;
     }
-    const segmentDir = path.join(DOWNLOAD_DIR, sessionId);
-    const mp4Path = path.join(DOWNLOAD_DIR, sessionId + ".mp4");
+    const segmentDir = path.join(TEMP_DIR, sessionId);
+    const mp4Path = path.join(OUTPUT_DIR, sessionId + ".mp4");
     const listPath = path.join(segmentDir, "list.txt");
 
     const chunks = [];
@@ -209,8 +216,24 @@ const server = http.createServer((req, res) => {
         } catch {
           // ignore
         }
+        // Xóa folder segments (không giữ lại)
+        try {
+          for (const f of fs.readdirSync(segmentDir)) {
+            fs.unlinkSync(path.join(segmentDir, f));
+          }
+          fs.rmdirSync(segmentDir);
+        } catch (e) {
+          console.warn("[finish] Xóa folder tạm:", e.message);
+        }
+
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, mp4: sessionId + ".mp4" }));
+        res.end(
+          JSON.stringify({
+            ok: true,
+            mp4: sessionId + ".mp4",
+            path: mp4Path,
+          }),
+        );
       } catch (e) {
         console.error(e.message || e);
         res.writeHead(500, { "Content-Type": "application/json" });
@@ -231,8 +254,9 @@ const server = http.createServer((req, res) => {
     const safeName = path
       .basename(String(filename))
       .replace(/[^a-zA-Z0-9._-]/g, "_");
-    const tsPath = path.join(DOWNLOAD_DIR, safeName);
-    const mp4Path = tsPath.replace(/\.ts$/i, ".mp4");
+    const tsPath = path.join(TEMP_DIR, safeName);
+    const mp4Name = safeName.replace(/\.ts$/i, ".mp4");
+    const mp4Path = path.join(OUTPUT_DIR, mp4Name);
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", async () => {
@@ -246,7 +270,7 @@ const server = http.createServer((req, res) => {
           // ignore
         }
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, mp4: path.basename(mp4Path) }));
+        res.end(JSON.stringify({ ok: true, mp4: mp4Name, path: mp4Path }));
       } catch (e) {
         console.error(e.message || e);
         res.writeHead(500, { "Content-Type": "application/json" });
@@ -268,10 +292,10 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Download server: http://localhost:${PORT}`);
-  console.log("  POST /segment  → lưu từng segment vào download/<sessionId>/");
-  console.log("  POST /finish    → gộp + convert → download/<sessionId>.mp4");
-  console.log("  POST /save      → gửi 1 file .ts → convert → .mp4 (fallback)");
-  console.log("Thư mục gốc:", DOWNLOAD_DIR);
+  console.log("  POST /segment  → tạm lưu segment");
+  console.log("  POST /finish   → gộp → .mp4 rồi xóa segments");
+  console.log("  POST /save     → gửi .ts đã gộp → convert → .mp4 (fallback)");
+  console.log("Thư mục lưu .mp4:", OUTPUT_DIR);
   const check = spawn(FFMPEG_PATH, ["-version"], { stdio: "ignore" });
   check.on("error", () => {
     console.warn("\n⚠ Không tìm thấy FFmpeg. Cài: brew install ffmpeg\n");

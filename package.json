@@ -13,9 +13,7 @@
     "zip:firefox": "wxt zip -b firefox",
     "compile": "vue-tsc --noEmit",
     "postinstall": "wxt prepare",
-    "download-server": "node scripts/download-server.cjs",
-    "convert-downloads": "node scripts/convert-downloads.cjs",
-    "merge-segments": "node scripts/merge-segments.cjs"
+    "download-server": "node scripts/download-server.cjs"
   },
   "dependencies": {
     "vue": "^3.5.27"
