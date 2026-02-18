@@ -84,6 +84,47 @@ function runFfmpegSingle(inputPath, outputPath) {
   });
 }
 
+/** Re-encode sang H.264 + AAC để tránh crash khi mở (HEVC/codec lạ). Dùng khi FORCE_COMPATIBLE_MP4=1 */
+function runFfmpegReencode(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    const ff = spawn(
+      FFMPEG_PATH,
+      [
+        "-y",
+        "-i",
+        inputPath,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        outputPath,
+      ],
+      { stdio: "pipe" },
+    );
+    ff.on("error", (e) => {
+      if (e.code === "ENOENT") {
+        reject(new Error("FFmpeg chưa cài. Trên macOS: brew install ffmpeg"));
+      } else reject(e);
+    });
+    let err = "";
+    ff.stderr.on("data", (d) => (err += d.toString()));
+    ff.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(err || `ffmpeg exit ${code}`));
+    });
+  });
+}
+
+const FORCE_COMPATIBLE_MP4 =
+  process.env.FORCE_COMPATIBLE_MP4 === "1" ||
+  process.env.FORCE_COMPATIBLE_MP4 === "true";
+
 function runFfmpegConcat(segmentDir, listFile, outputPathAbsolute) {
   return new Promise((resolve, reject) => {
     const ff = spawn(
@@ -209,12 +250,24 @@ const server = http.createServer((req, res) => {
         console.log("[finish]", sessionId, "files:", files.length);
         const listLines = files.map((f) => `file '${f}'`).join("\n");
         fs.writeFileSync(listPath, listLines, "utf8");
-        const outputRelative = path.relative(segmentDir, mp4Path);
-        await runFfmpegConcat(segmentDir, "list.txt", outputRelative);
+        await runFfmpegConcat(segmentDir, "list.txt", path.resolve(mp4Path));
         try {
           fs.unlinkSync(listPath);
         } catch {
           // ignore
+        }
+        if (FORCE_COMPATIBLE_MP4) {
+          const compatPath = path.join(
+            TEMP_DIR,
+            "compat-" + sessionId + ".mp4",
+          );
+          await runFfmpegReencode(mp4Path, compatPath);
+          try {
+            fs.unlinkSync(mp4Path);
+            fs.renameSync(compatPath, mp4Path);
+          } catch (e) {
+            console.warn("[finish] Re-encode replace:", e.message);
+          }
         }
         // Xóa folder segments (không giữ lại)
         try {
@@ -269,6 +322,19 @@ const server = http.createServer((req, res) => {
         } catch {
           // ignore
         }
+        if (FORCE_COMPATIBLE_MP4) {
+          const compatPath = path.join(
+            TEMP_DIR,
+            "compat-save-" + safeName + ".mp4",
+          );
+          await runFfmpegReencode(mp4Path, compatPath);
+          try {
+            fs.unlinkSync(mp4Path);
+            fs.renameSync(compatPath, mp4Path);
+          } catch (e) {
+            console.warn("[save] Re-encode replace:", e.message);
+          }
+        }
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, mp4: mp4Name, path: mp4Path }));
       } catch (e) {
@@ -296,6 +362,8 @@ server.listen(PORT, () => {
   console.log("  POST /finish   → gộp → .mp4 rồi xóa segments");
   console.log("  POST /save     → gửi .ts đã gộp → convert → .mp4 (fallback)");
   console.log("Thư mục lưu .mp4:", OUTPUT_DIR);
+  if (FORCE_COMPATIBLE_MP4)
+    console.log("  Re-encode H.264+AAC: BẬT (FORCE_COMPATIBLE_MP4)");
   const check = spawn(FFMPEG_PATH, ["-version"], { stdio: "ignore" });
   check.on("error", () => {
     console.warn("\n⚠ Không tìm thấy FFmpeg. Cài: brew install ffmpeg\n");

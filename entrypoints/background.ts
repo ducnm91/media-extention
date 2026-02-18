@@ -1,7 +1,50 @@
+// Lưu URL M3U8 gần nhất theo tab (từ webRequest) để content script lấy khi bấm Download
+const lastM3u8ByTab = new Map<number, string>();
+
+/** Trả về URL playlist M3U8 thật: hoặc chính url (nếu path kết thúc .m3u8), hoặc trích từ query (vd: ping?mu=...m3u8). */
+function getM3u8UrlToStore(requestUrl: string): string | null {
+  if (!requestUrl || !requestUrl.includes("m3u8")) return null;
+  try {
+    const u = new URL(requestUrl);
+    if (u.pathname.endsWith(".m3u8") || u.pathname.includes(".m3u8"))
+      return requestUrl;
+    const params = u.searchParams;
+    const keys = ["mu", "url", "src", "manifest", "playlist", "m3u8", "hls"];
+    for (const key of keys) {
+      const val = params.get(key);
+      if (!val) continue;
+      const decoded = decodeURIComponent(val);
+      if (
+        (decoded.startsWith("http://") || decoded.startsWith("https://")) &&
+        decoded.includes("m3u8")
+      )
+        return decoded;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
 export default defineBackground(() => {
   console.log("Hello background!", { id: browser.runtime.id });
 
   let lastError: string | null = null;
+
+  // Chỉ lưu URL thực sự là M3U8 (path .m3u8) hoặc trích từ query (vd: jwplayer ping?mu=...index.m3u8)
+  browser.webRequest.onCompleted.addListener(
+    (details) => {
+      const toStore = getM3u8UrlToStore(details.url || "");
+      if (toStore && details.tabId > 0)
+        lastM3u8ByTab.set(details.tabId, toStore);
+    },
+    { urls: ["<all_urls>"] },
+  );
+
+  // Dọn URL khi tab đóng
+  browser.tabs.onRemoved.addListener((tabId) => {
+    lastM3u8ByTab.delete(tabId);
+  });
 
   browser.runtime.onMessage.addListener(
     (
@@ -13,6 +56,21 @@ export default defineBackground(() => {
         sendResponse(lastError ?? "");
         return true;
       }
+      if (message.type === "GET_LAST_M3U8" && sender.tab?.id) {
+        const url = lastM3u8ByTab.get(sender.tab.id) ?? null;
+        sendResponse(url);
+        return false;
+      }
+      if (message.type === "INSPECT_M3U8" && message.url) {
+        inspectM3u8(message.url)
+          .then(sendResponse)
+          .catch((err) =>
+            sendResponse({
+              error: err instanceof Error ? err.message : String(err),
+            }),
+          );
+        return true;
+      }
       if (message.type === "DOWNLOAD_HLS" && message.url && sender.tab?.id) {
         lastError = null;
         const tabId = sender.tab.id;
@@ -22,11 +80,16 @@ export default defineBackground(() => {
               sendResponse(true);
               return;
             }
-            const sessionId = result.filename.replace(/\.ts$/i, "");
-            const saved = await trySaveSegmentsToServer(
-              result.segmentBuffers,
-              sessionId,
-            );
+            const sessionId = result.filename
+              .replace(/\.ts$/i, "")
+              .replace(/\.mp4$/i, "");
+            const saved =
+              result.segmentBuffers.length > 0
+                ? await trySaveSegmentsToServer(
+                    result.segmentBuffers,
+                    sessionId,
+                  )
+                : null;
             if (saved) {
               try {
                 await browser.tabs.sendMessage(
@@ -94,35 +157,96 @@ function resolveUrl(base: string, relative: string): string {
   return base + rel;
 }
 
-/** Parse m3u8 text, return segment URIs (and variant URL if master). */
+/** Một segment: URL và tùy chọn byte range (cho fMP4 / single-file). */
+type SegmentRef = { url: string; range?: string };
+
+/** Parse m3u8: segment list (TS hoặc fMP4), init segment (fMP4), và variant nếu là master. */
 function parseM3u8(
   text: string,
   baseUrl: string,
-): { segments: string[]; variantUrl: string | null } {
+): {
+  segments: SegmentRef[];
+  initSegment?: SegmentRef;
+  variantUrl: string | null;
+  variants: { url: string; bandwidth?: number; resolution?: string }[];
+} {
   const lines = text
     .split(/\r?\n/)
     .map((l) => l.trim())
     .filter(Boolean);
-  const segments: string[] = [];
+  const segments: SegmentRef[] = [];
+  let initSegment: SegmentRef | undefined;
+  const variants: { url: string; bandwidth?: number; resolution?: string }[] =
+    [];
   let variantUrl: string | null = null;
+
+  let lastSegmentUri: string | null = null;
+  let nextByterange: string | null = null;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+
     if (line.startsWith("#EXT-X-STREAM-INF")) {
       const next = lines[i + 1];
       if (next && !next.startsWith("#")) {
-        variantUrl = resolveUrl(baseUrl, next);
-        break;
+        const url = resolveUrl(baseUrl, next);
+        const bandwidth = line.match(/BANDWIDTH=(\d+)/)?.[1];
+        const resolution = line.match(/RESOLUTION=(\d+x\d+)/)?.[1];
+        variants.push({
+          url,
+          bandwidth: bandwidth ? parseInt(bandwidth, 10) : undefined,
+          resolution,
+        });
+        if (!variantUrl) variantUrl = url;
       }
     }
+
+    if (line.startsWith("#EXT-X-MAP:")) {
+      const uriMatch = line.match(/URI="([^"]+)"/);
+      const rangeMatch = line.match(/BYTERANGE="(\d+)(?:@(\d+))?"/);
+      if (uriMatch) {
+        const url = resolveUrl(baseUrl, uriMatch[1].trim());
+        const range = rangeMatch
+          ? rangeMatch[2]
+            ? `${rangeMatch[1]}@${rangeMatch[2]}`
+            : rangeMatch[1]
+          : undefined;
+        initSegment = { url, range };
+        lastSegmentUri = url;
+      }
+    }
+
+    if (line.startsWith("#EXT-X-BYTERANGE:")) {
+      const m = line.match(/#EXT-X-BYTERANGE:(.+)/);
+      nextByterange = m ? m[1].trim() : null;
+    }
+
     if (line.startsWith("#EXTINF:")) {
       const next = lines[i + 1];
       if (next && !next.startsWith("#")) {
-        segments.push(resolveUrl(baseUrl, next));
+        const segUrl = resolveUrl(baseUrl, next);
+        lastSegmentUri = segUrl;
+        if (nextByterange) {
+          segments.push({ url: segUrl, range: nextByterange });
+        } else {
+          segments.push({ url: segUrl });
+        }
+        nextByterange = null;
       }
+    } else if (nextByterange && lastSegmentUri) {
+      segments.push({ url: lastSegmentUri, range: nextByterange });
+      nextByterange = null;
     }
   }
-  return { segments, variantUrl };
+
+  if (variants.length > 1) {
+    const videoVariant =
+      variants.find((v) => v.resolution) ||
+      variants.sort((a, b) => (b.bandwidth ?? 0) - (a.bandwidth ?? 0))[0];
+    if (videoVariant) variantUrl = videoVariant.url;
+  }
+
+  return { segments, initSegment, variantUrl, variants };
 }
 
 async function fetchText(url: string): Promise<string> {
@@ -131,8 +255,104 @@ async function fetchText(url: string): Promise<string> {
   return res.text();
 }
 
-async function fetchBytes(url: string): Promise<ArrayBuffer> {
-  const res = await fetch(url, { mode: "cors", credentials: "omit" });
+/** Kiểm tra M3U8: fetch, parse, trả về thông tin để debug (hiển thị trong popup). */
+async function inspectM3u8(url: string): Promise<{
+  inspectedUrl: string;
+  fetchError?: string;
+  contentType: "master" | "media" | "unknown";
+  rawFirstLines: string;
+  parsed: {
+    segmentsCount: number;
+    initSegment: boolean;
+    hasByteRange: boolean;
+    variantUrl: string | null;
+    variantsCount: number;
+    variants: { url: string; bandwidth?: number; resolution?: string }[];
+  };
+  variantRawFirstLines?: string;
+  variantParsed?: {
+    segmentsCount: number;
+    initSegment: boolean;
+    hasByteRange: boolean;
+  };
+}> {
+  const baseUrl = getBaseUrl(url);
+  let raw = "";
+  let fetchError: string | undefined;
+  try {
+    raw = await fetchText(url);
+  } catch (e) {
+    fetchError = e instanceof Error ? e.message : String(e);
+    return {
+      inspectedUrl: url,
+      fetchError,
+      contentType: "unknown",
+      rawFirstLines: "",
+      parsed: {
+        segmentsCount: 0,
+        initSegment: false,
+        hasByteRange: false,
+        variantUrl: null,
+        variantsCount: 0,
+        variants: [],
+      },
+    };
+  }
+  const lines = raw.split(/\r?\n/);
+  const rawFirstLines = lines.slice(0, 60).join("\n");
+  const parsed = parseM3u8(raw, baseUrl);
+  const contentType = parsed.variants.length > 0 ? "master" : "media";
+  let variantRawFirstLines: string | undefined;
+  let variantParsed:
+    | { segmentsCount: number; initSegment: boolean; hasByteRange: boolean }
+    | undefined;
+  if (parsed.variantUrl) {
+    try {
+      const variantText = await fetchText(parsed.variantUrl);
+      const vLines = variantText.split(/\r?\n/);
+      variantRawFirstLines = vLines.slice(0, 60).join("\n");
+      const vParsed = parseM3u8(variantText, getBaseUrl(parsed.variantUrl));
+      variantParsed = {
+        segmentsCount: vParsed.segments.length,
+        initSegment: !!vParsed.initSegment,
+        hasByteRange: vParsed.segments.some((s) => !!s.range),
+      };
+    } catch {
+      variantRawFirstLines = "(không fetch được variant)";
+    }
+  }
+  return {
+    inspectedUrl: url,
+    fetchError,
+    contentType,
+    rawFirstLines,
+    parsed: {
+      segmentsCount: parsed.segments.length,
+      initSegment: !!parsed.initSegment,
+      hasByteRange: parsed.segments.some((s) => !!s.range),
+      variantUrl: parsed.variantUrl,
+      variantsCount: parsed.variants.length,
+      variants: parsed.variants,
+    },
+    variantRawFirstLines,
+    variantParsed,
+  };
+}
+
+/** Fetch với tùy chọn Range (cho fMP4 single-file). range dạng "length@offset" hoặc "length". */
+async function fetchBytes(url: string, range?: string): Promise<ArrayBuffer> {
+  const headers: Record<string, string> = {};
+  if (range) {
+    const [len, off] = range.split("@").map((s) => s.trim());
+    const length = parseInt(len, 10);
+    const offset = off ? parseInt(off, 10) : 0;
+    headers.Range = `bytes=${offset}-${offset + length - 1}`;
+  }
+  const res = await fetch(url, {
+    mode: "cors",
+    credentials: "omit",
+    headers: Object.keys(headers).length ? headers : undefined,
+  });
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${url}`);
   return res.arrayBuffer();
 }
@@ -242,35 +462,55 @@ async function downloadHls(
 } | null> {
   const baseUrl = getBaseUrl(m3u8Url);
   let text = await fetchText(m3u8Url);
-  let { segments, variantUrl } = parseM3u8(text, baseUrl);
+  let parsed = parseM3u8(text, baseUrl);
+  let { segments, initSegment, variantUrl } = parsed;
 
   if (variantUrl) {
     const variantBase = getBaseUrl(variantUrl);
     text = await fetchText(variantUrl);
-    const parsed = parseM3u8(text, variantBase);
-    if (parsed.segments.length) segments = parsed.segments;
+    parsed = parseM3u8(text, variantBase);
+    if (parsed.segments.length || parsed.initSegment) {
+      segments = parsed.segments;
+      initSegment = parsed.initSegment;
+    }
   }
 
-  if (!segments.length)
-    throw new Error("Không tìm thấy segment nào trong M3U8.");
+  const isFmp4 = !!initSegment || segments.some((s) => s.range);
+  if (!segments.length && !initSegment)
+    throw new Error(
+      "Không tìm thấy segment nào trong M3U8 (có thể là DASH .mpd hoặc định dạng khác).",
+    );
 
   const segmentBuffers: ArrayBuffer[] = [];
+  const totalParts = (initSegment ? 1 : 0) + segments.length;
+
+  if (initSegment) {
+    const buf = await fetchBytes(initSegment.url, initSegment.range);
+    segmentBuffers.push(buf);
+    try {
+      await browser.tabs.sendMessage(
+        tabId,
+        { type: "HLS_DOWNLOAD_PROGRESS", current: 1, total: totalParts },
+        { frameId: 0 },
+      );
+    } catch {}
+  }
+
   for (let i = 0; i < segments.length; i++) {
-    const buf = await fetchBytes(segments[i]);
+    const seg = segments[i];
+    const buf = await fetchBytes(seg.url, seg.range);
     segmentBuffers.push(buf);
     try {
       await browser.tabs.sendMessage(
         tabId,
         {
           type: "HLS_DOWNLOAD_PROGRESS",
-          current: i + 1,
-          total: segments.length,
+          current: (initSegment ? 1 : 0) + i + 1,
+          total: totalParts,
         },
         { frameId: 0 },
       );
-    } catch {
-      // Tab có thể đã đóng
-    }
+    } catch {}
   }
 
   const totalLength = segmentBuffers.reduce((s, c) => s + c.byteLength, 0);
@@ -281,10 +521,12 @@ async function downloadHls(
     offset += c.byteLength;
   }
 
-  const filename = `hls-download-${Date.now()}.ts`;
+  const filename = isFmp4
+    ? `hls-download-${Date.now()}.mp4`
+    : `hls-download-${Date.now()}.ts`;
   return {
     buffer: combined.buffer,
     filename,
-    segmentBuffers,
+    segmentBuffers: isFmp4 ? [] : segmentBuffers,
   };
 }
