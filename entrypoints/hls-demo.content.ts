@@ -382,6 +382,7 @@ async function startDownload(m3u8Url: string) {
     const ok = await browser.runtime.sendMessage({
       type: "DOWNLOAD_HLS",
       url: m3u8Url,
+      pageTitle: document.title || "",
     });
     if (!ok && ok !== undefined) {
       const err = await browser.runtime.sendMessage({ type: "GET_LAST_ERROR" });

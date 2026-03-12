@@ -48,7 +48,7 @@ export default defineBackground(() => {
 
   browser.runtime.onMessage.addListener(
     (
-      message: { type: string; url?: string },
+      message: { type: string; url?: string; pageTitle?: string },
       sender: { tab?: { id?: number } },
       sendResponse,
     ) => {
@@ -74,7 +74,19 @@ export default defineBackground(() => {
       if (message.type === "DOWNLOAD_HLS" && message.url && sender.tab?.id) {
         lastError = null;
         const tabId = sender.tab.id;
-        downloadHls(message.url, tabId)
+
+        if (
+          !activeDownloadTabs.has(tabId) &&
+          activeDownloadTabs.size >= CONFIG.maxParallelDownloadTabs
+        ) {
+          lastError = `Đang tải tối đa ${CONFIG.maxParallelDownloadTabs} tab cùng lúc. Đợi một số tab tải xong rồi thử lại.`;
+          sendResponse(false);
+          return false;
+        }
+
+        activeDownloadTabs.add(tabId);
+
+        downloadHls(message.url, tabId, message.pageTitle || "")
           .then(async (result) => {
             if (!result) {
               sendResponse(true);
@@ -128,6 +140,9 @@ export default defineBackground(() => {
           .catch((err) => {
             lastError = err instanceof Error ? err.message : String(err);
             sendResponse(false);
+          })
+          .finally(() => {
+            activeDownloadTabs.delete(tabId);
           });
         return true; // keep channel open for async sendResponse
       }
@@ -360,6 +375,27 @@ async function fetchBytes(url: string, range?: string): Promise<ArrayBuffer> {
 const SERVER_BASE = "http://127.0.0.1:8765";
 const CHUNK_SIZE = 8 * 1024 * 1024; // 8MB mỗi message (tránh giới hạn postMessage)
 
+const CONFIG = {
+  // Số tab tối đa được phép tải HLS cùng lúc
+  maxParallelDownloadTabs: 4,
+  // Số segment tải song song cho mỗi video
+  segmentFetchConcurrency: 8,
+} as const;
+
+const activeDownloadTabs = new Set<number>();
+
+function sanitizeTitleForFilename(title: string): string {
+  const trimmed = (title || "").trim();
+  if (!trimmed) return "";
+  const noExt = trimmed.replace(/\.[a-zA-Z0-9]{1,4}$/, "");
+  const replaced = noExt
+    .replace(/[\/\\:*?"<>|]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\s+/g, "_");
+  return replaced.slice(0, 80);
+}
+
 /** Gửi từng segment lên server, sau đó /finish → .mp4 + folder segments. */
 async function trySaveSegmentsToServer(
   segmentBuffers: ArrayBuffer[],
@@ -367,18 +403,28 @@ async function trySaveSegmentsToServer(
 ): Promise<string | null> {
   try {
     const total = segmentBuffers.length;
-    for (let i = 0; i < total; i++) {
-      const body = new Uint8Array(segmentBuffers[i]);
-      const res = await fetch(`${SERVER_BASE}/segment`, {
-        method: "POST",
-        body,
-        headers: {
-          "X-Session-Id": sessionId,
-          "X-Index": String(i),
-          "X-Total": String(total),
-        },
-      });
-      if (!res.ok) return null;
+    const concurrency = Math.max(
+      1,
+      Math.min(CONFIG.segmentFetchConcurrency, total),
+    );
+    for (let i = 0; i < total; i += concurrency) {
+      const batch = segmentBuffers.slice(i, i + concurrency);
+      const responses = await Promise.all(
+        batch.map((buf, idx) => {
+          const body = new Uint8Array(buf);
+          const index = i + idx;
+          return fetch(`${SERVER_BASE}/segment`, {
+            method: "POST",
+            body,
+            headers: {
+              "X-Session-Id": sessionId,
+              "X-Index": String(index),
+              "X-Total": String(total),
+            },
+          });
+        }),
+      );
+      if (responses.some((res) => !res.ok)) return null;
     }
     const finishRes = await fetch(`${SERVER_BASE}/finish`, {
       method: "POST",
@@ -455,6 +501,7 @@ async function sendChunksToTab(
 async function downloadHls(
   m3u8Url: string,
   tabId: number,
+  pageTitle: string,
 ): Promise<{
   buffer: ArrayBuffer;
   filename: string;
@@ -496,21 +543,31 @@ async function downloadHls(
     } catch {}
   }
 
-  for (let i = 0; i < segments.length; i++) {
-    const seg = segments[i];
-    const buf = await fetchBytes(seg.url, seg.range);
-    segmentBuffers.push(buf);
-    try {
-      await browser.tabs.sendMessage(
-        tabId,
-        {
-          type: "HLS_DOWNLOAD_PROGRESS",
-          current: (initSegment ? 1 : 0) + i + 1,
-          total: totalParts,
-        },
-        { frameId: 0 },
-      );
-    } catch {}
+  const concurrency = Math.max(
+    1,
+    Math.min(CONFIG.segmentFetchConcurrency, segments.length),
+  );
+  for (let i = 0; i < segments.length; i += concurrency) {
+    const batch = segments.slice(i, i + concurrency);
+    const buffers = await Promise.all(
+      batch.map((seg) => fetchBytes(seg.url, seg.range)),
+    );
+    for (let j = 0; j < buffers.length; j++) {
+      const buf = buffers[j];
+      segmentBuffers.push(buf);
+      const segIndex = i + j;
+      try {
+        await browser.tabs.sendMessage(
+          tabId,
+          {
+            type: "HLS_DOWNLOAD_PROGRESS",
+            current: (initSegment ? 1 : 0) + segIndex + 1,
+            total: totalParts,
+          },
+          { frameId: 0 },
+        );
+      } catch {}
+    }
   }
 
   const totalLength = segmentBuffers.reduce((s, c) => s + c.byteLength, 0);
@@ -521,9 +578,10 @@ async function downloadHls(
     offset += c.byteLength;
   }
 
-  const filename = isFmp4
-    ? `hls-download-${Date.now()}.mp4`
-    : `hls-download-${Date.now()}.ts`;
+  const safeTitle = sanitizeTitleForFilename(pageTitle);
+  const base =
+    safeTitle || `hls-download-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const filename = isFmp4 ? `${base}.mp4` : `${base}.ts`;
   return {
     buffer: combined.buffer,
     filename,
