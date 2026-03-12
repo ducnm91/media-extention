@@ -31,6 +31,72 @@ export default defineBackground(() => {
 
   let lastError: string | null = null;
 
+  (async () => {
+    try {
+      const stored = await browser.storage.sync.get([
+        "maxParallelDownloadTabs",
+        "segmentFetchConcurrency",
+      ]);
+      const maxTabs =
+        typeof stored.maxParallelDownloadTabs === "number"
+          ? stored.maxParallelDownloadTabs
+          : DEFAULT_CONFIG.maxParallelDownloadTabs;
+      const segConc =
+        typeof stored.segmentFetchConcurrency === "number"
+          ? stored.segmentFetchConcurrency
+          : DEFAULT_CONFIG.segmentFetchConcurrency;
+      CONFIG = {
+        maxParallelDownloadTabs: Math.max(
+          1,
+          Math.min(20, Math.floor(maxTabs)),
+        ),
+        segmentFetchConcurrency: Math.max(
+          1,
+          Math.min(64, Math.floor(segConc)),
+        ),
+      };
+      console.log("Loaded download config:", CONFIG);
+    } catch (e) {
+      console.warn(
+        "[background] Không thể tải cấu hình, dùng mặc định.",
+        e && (e as Error).message,
+      );
+      CONFIG = { ...DEFAULT_CONFIG };
+    }
+
+    try {
+      browser.storage.onChanged.addListener((changes, area) => {
+        if (area !== "sync") return;
+        let changed = false;
+        if (changes.maxParallelDownloadTabs) {
+          const v = changes.maxParallelDownloadTabs.newValue;
+          if (typeof v === "number") {
+            CONFIG.maxParallelDownloadTabs = Math.max(
+              1,
+              Math.min(20, Math.floor(v)),
+            );
+            changed = true;
+          }
+        }
+        if (changes.segmentFetchConcurrency) {
+          const v = changes.segmentFetchConcurrency.newValue;
+          if (typeof v === "number") {
+            CONFIG.segmentFetchConcurrency = Math.max(
+              1,
+              Math.min(64, Math.floor(v)),
+            );
+            changed = true;
+          }
+        }
+        if (changed) {
+          console.log("Updated download config:", CONFIG);
+        }
+      });
+    } catch {
+      // ignore
+    }
+  })();
+
   // Chỉ lưu URL thực sự là M3U8 (path .m3u8) hoặc trích từ query (vd: jwplayer ping?mu=...index.m3u8)
   browser.webRequest.onCompleted.addListener(
     (details) => {
@@ -419,12 +485,17 @@ async function fetchBytes(url: string, range?: string): Promise<ArrayBuffer> {
 const SERVER_BASE = "http://127.0.0.1:8765";
 const CHUNK_SIZE = 8 * 1024 * 1024; // 8MB mỗi message (tránh giới hạn postMessage)
 
-const CONFIG = {
-  // Số tab tối đa được phép tải HLS cùng lúc
+type DownloadConfig = {
+  maxParallelDownloadTabs: number;
+  segmentFetchConcurrency: number;
+};
+
+const DEFAULT_CONFIG: DownloadConfig = {
   maxParallelDownloadTabs: 4,
-  // Số segment tải song song cho mỗi video
   segmentFetchConcurrency: 8,
-} as const;
+};
+
+let CONFIG: DownloadConfig = { ...DEFAULT_CONFIG };
 
 const activeDownloadTabs = new Set<number>();
 const activeDownloadTitles = new Set<string>();
