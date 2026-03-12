@@ -85,6 +85,7 @@ export default defineBackground(() => {
         }
 
         activeDownloadTabs.add(tabId);
+        updateActionBadge();
 
         downloadHls(message.url, tabId, message.pageTitle || "")
           .then(async (result) => {
@@ -112,6 +113,11 @@ export default defineBackground(() => {
               } catch {
                 // Tab đã đóng hoặc reload
               }
+              try {
+                await browser.tabs.remove(tabId);
+              } catch {
+                // ignore
+              }
               sendResponse(true);
               return;
             }
@@ -129,6 +135,11 @@ export default defineBackground(() => {
               } catch {
                 // Tab đã đóng hoặc reload
               }
+              try {
+                await browser.tabs.remove(tabId);
+              } catch {
+                // ignore
+              }
               sendResponse(true);
               return;
             }
@@ -143,6 +154,8 @@ export default defineBackground(() => {
           })
           .finally(() => {
             activeDownloadTabs.delete(tabId);
+            updateActionBadge();
+            void notifyAllDownloadsDone();
           });
         return true; // keep channel open for async sendResponse
       }
@@ -383,6 +396,31 @@ const CONFIG = {
 } as const;
 
 const activeDownloadTabs = new Set<number>();
+
+function updateActionBadge() {
+  const count = activeDownloadTabs.size;
+  if (count > 0) {
+    browser.action.setBadgeText({ text: String(count) });
+    browser.action.setBadgeBackgroundColor({ color: "#2e7d32" });
+  } else {
+    browser.action.setBadgeText({ text: "" });
+  }
+}
+
+async function notifyAllDownloadsDone() {
+  if (activeDownloadTabs.size === 0) {
+    try {
+      await browser.notifications.create({
+        type: "basic",
+        iconUrl: browser.runtime.getURL("wxt.svg"),
+        title: "HLS Downloader",
+        message: "Đã tải xong tất cả video đang xử lý.",
+      });
+    } catch {
+      // ignore nếu trình duyệt không hỗ trợ notifications
+    }
+  }
+}
 
 function sanitizeTitleForFilename(title: string): string {
   const trimmed = (title || "").trim();
