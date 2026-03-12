@@ -274,6 +274,35 @@ function formatInspectReport(data: Record<string, unknown>): string {
   return lines.join("\n");
 }
 
+function collectPageMetadata(): {
+  sourceUrl: string;
+  actors: string[];
+  tags: string[];
+} {
+  const sourceUrl = window.location.href;
+  const hostname = window.location.hostname || "";
+
+  let actors: string[] = [];
+  let tags: string[] = [];
+
+  if (hostname.includes("xvideos.com")) {
+    actors = Array.from(
+      document.querySelectorAll<HTMLElement>("li.model span.name"),
+    )
+      .map((el) => (el.textContent || "").trim())
+      .filter((v) => v.length > 0);
+    tags = Array.from(
+      document.querySelectorAll<HTMLAnchorElement>(
+        'a.is-keyword.btn.btn-default[href^="/tags/"]',
+      ),
+    )
+      .map((el) => (el.textContent || "").trim())
+      .filter((v) => v.length > 0);
+  }
+
+  return { sourceUrl, actors, tags };
+}
+
 function injectDownloadButton() {
   const wrap = document.createElement("div");
   wrap.id = "hls-download-extension-wrap";
@@ -379,10 +408,12 @@ async function startDownload(m3u8Url: string) {
     (btn as HTMLButtonElement).textContent = "⏳ Đang tải...";
   }
   try {
+    const meta = collectPageMetadata();
     const ok = await browser.runtime.sendMessage({
       type: "DOWNLOAD_HLS",
       url: m3u8Url,
       pageTitle: document.title || "",
+      meta,
     });
     if (!ok && ok !== undefined) {
       const err = await browser.runtime.sendMessage({ type: "GET_LAST_ERROR" });

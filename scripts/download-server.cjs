@@ -14,11 +14,13 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const crypto = require("crypto");
 const { spawn, execSync } = require("child_process");
 
 const PORT = 8765;
 const ROOT = path.join(__dirname, "..");
 const OUTPUT_DIR = process.env.DOWNLOAD_DIR || path.join(ROOT, "download");
+const META_FILE = path.join(OUTPUT_DIR, "videos-metadata.jsonl");
 const TEMP_DIR = path.join(os.tmpdir(), "hls-extension-download");
 
 if (!fs.existsSync(OUTPUT_DIR)) {
@@ -62,6 +64,27 @@ function getFfmpegPath() {
 }
 
 const FFMPEG_PATH = getFfmpegPath();
+const SEEN_SOURCE_URLS = new Set();
+
+try {
+  if (fs.existsSync(META_FILE)) {
+    const content = fs.readFileSync(META_FILE, "utf8");
+    for (const line of content.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const obj = JSON.parse(trimmed);
+        if (obj && typeof obj.sourceUrl === "string" && obj.sourceUrl) {
+          SEEN_SOURCE_URLS.add(obj.sourceUrl);
+        }
+      } catch {
+        // ignore malformed line
+      }
+    }
+  }
+} catch (e) {
+  console.warn("[meta] init failed:", e.message || e);
+}
 
 function runFfmpegSingle(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
@@ -157,12 +180,37 @@ function runFfmpegConcat(segmentDir, listFile, outputPathAbsolute) {
   });
 }
 
+function parseJsonArrayHeader(req, name) {
+  const raw = req.headers[name.toLowerCase()] || req.headers[name] || "";
+  if (!raw) return [];
+  try {
+    const v = JSON.parse(String(raw));
+    if (Array.isArray(v)) return v.map((x) => String(x));
+  } catch {
+    // ignore
+  }
+  return [];
+}
+
+function appendMetadata(record) {
+  try {
+    if (record.sourceUrl && SEEN_SOURCE_URLS.has(record.sourceUrl)) {
+      return;
+    }
+    const line = JSON.stringify(record);
+    fs.appendFileSync(META_FILE, line + "\n", "utf8");
+    if (record.sourceUrl) SEEN_SOURCE_URLS.add(record.sourceUrl);
+  } catch (e) {
+    console.warn("[meta] append failed:", e.message || e);
+  }
+}
+
 const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "X-Session-Id, X-Index, X-Total, X-Filename, Content-Type",
+    "X-Session-Id, X-Index, X-Total, X-Filename, X-Source-Url, X-Page-Title, X-Actors, X-Tags, Content-Type",
   );
 
   if (req.method === "OPTIONS") {
@@ -269,6 +317,27 @@ const server = http.createServer((req, res) => {
             console.warn("[finish] Re-encode replace:", e.message);
           }
         }
+        // Ghi metadata JSONL
+        const sourceUrl = String(req.headers["x-source-url"] || "");
+        const pageTitle = String(req.headers["x-page-title"] || "");
+        const actors = parseJsonArrayHeader(req, "x-actors");
+        const tags = parseJsonArrayHeader(req, "x-tags");
+        const idSource = sourceUrl || sessionId;
+        const id = crypto
+          .createHash("sha1")
+          .update(String(idSource))
+          .digest("hex")
+          .slice(0, 16);
+        appendMetadata({
+          id,
+          title: pageTitle || "",
+          fileName: path.basename(mp4Path),
+          filePath: path.relative(ROOT, mp4Path),
+          sourceUrl,
+          actors,
+          tags,
+        });
+
         // Xóa folder segments (không giữ lại)
         try {
           for (const f of fs.readdirSync(segmentDir)) {
@@ -335,6 +404,26 @@ const server = http.createServer((req, res) => {
             console.warn("[save] Re-encode replace:", e.message);
           }
         }
+        const sourceUrl = String(req.headers["x-source-url"] || "");
+        const pageTitle = String(req.headers["x-page-title"] || "");
+        const actors = parseJsonArrayHeader(req, "x-actors");
+        const tags = parseJsonArrayHeader(req, "x-tags");
+        const idSource = sourceUrl || mp4Name;
+        const id = crypto
+          .createHash("sha1")
+          .update(String(idSource))
+          .digest("hex")
+          .slice(0, 16);
+        appendMetadata({
+          id,
+          title: pageTitle || "",
+          fileName: mp4Name,
+          filePath: path.relative(ROOT, mp4Path),
+          sourceUrl,
+          actors,
+          tags,
+        });
+
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, mp4: mp4Name, path: mp4Path }));
       } catch (e) {

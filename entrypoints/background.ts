@@ -48,7 +48,17 @@ export default defineBackground(() => {
 
   browser.runtime.onMessage.addListener(
     (
-      message: { type: string; url?: string; pageTitle?: string },
+      message: {
+        type: string;
+        url?: string;
+        pageTitle?: string;
+        meta?: {
+          sourceUrl?: string;
+          actors?: string[];
+          tags?: string[];
+          pageTitle?: string;
+        };
+      },
       sender: { tab?: { id?: number } },
       sendResponse,
     ) => {
@@ -74,21 +84,22 @@ export default defineBackground(() => {
       if (message.type === "DOWNLOAD_HLS" && message.url && sender.tab?.id) {
         lastError = null;
         const tabId = sender.tab.id;
-        const titleKey = normalizeTitleKey(message.pageTitle);
+        const rawMeta = message.meta || {};
+        const sanitizedTitle = sanitizePageTitleForMetadata(
+          rawMeta.sourceUrl,
+          message.pageTitle,
+        );
+        const titleKey = normalizeTitleKey(sanitizedTitle);
+        const meta = {
+          ...rawMeta,
+          pageTitle: sanitizedTitle,
+        };
 
-        if (titleKey) {
-          if (activeDownloadTitles.has(titleKey)) {
-            lastError =
-              "Video này (theo title trang) đang được tải. Đợi tải xong rồi hãy bấm lại để tránh trùng.";
-            sendResponse(false);
-            return false;
-          }
-          if (completedDownloadTitles.has(titleKey)) {
-            lastError =
-              "Video này (theo title trang) đã được tải trước đó. Kiểm tra thư mục lưu video trước khi tải lại.";
-            sendResponse(false);
-            return false;
-          }
+        if (titleKey && activeDownloadTitles.has(titleKey)) {
+          lastError =
+            "Video này (theo title trang) đang được tải. Đợi tải xong rồi hãy bấm lại để tránh trùng.";
+          sendResponse(false);
+          return false;
         }
 
         if (
@@ -118,10 +129,10 @@ export default defineBackground(() => {
                 ? await trySaveSegmentsToServer(
                     result.segmentBuffers,
                     sessionId,
+                    meta,
                   )
                 : null;
             if (saved) {
-              if (titleKey) completedDownloadTitles.add(titleKey);
               try {
                 await browser.tabs.sendMessage(
                   tabId,
@@ -142,9 +153,9 @@ export default defineBackground(() => {
             const fallback = await trySaveToServer(
               result.buffer,
               result.filename,
+              meta,
             );
             if (fallback) {
-              if (titleKey) completedDownloadTitles.add(titleKey);
               try {
                 await browser.tabs.sendMessage(
                   tabId,
@@ -163,10 +174,9 @@ export default defineBackground(() => {
               return;
             }
             const buffer = result.buffer;
-            return sendChunksToTab(tabId, buffer, result.filename).then(() => {
-              if (titleKey) completedDownloadTitles.add(titleKey);
-              sendResponse(true);
-            });
+            return sendChunksToTab(tabId, buffer, result.filename).then(() =>
+              sendResponse(true),
+            );
           })
           .catch((err) => {
             lastError = err instanceof Error ? err.message : String(err);
@@ -418,7 +428,6 @@ const CONFIG = {
 
 const activeDownloadTabs = new Set<number>();
 const activeDownloadTitles = new Set<string>();
-const completedDownloadTitles = new Set<string>();
 
 function updateActionBadge() {
   const count = activeDownloadTabs.size;
@@ -462,10 +471,36 @@ function normalizeTitleKey(title: string | undefined): string {
   return title.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
+function sanitizePageTitleForMetadata(
+  sourceUrl: string | undefined,
+  pageTitle: string | undefined,
+): string {
+  if (!pageTitle) return "";
+  let host = "";
+  try {
+    if (sourceUrl) {
+      host = new URL(sourceUrl).hostname || "";
+    }
+  } catch {
+    // ignore invalid URL
+  }
+  let t = pageTitle.trim();
+  if (host.includes("xvideos.com")) {
+    t = t.replace(/\s*-\s*XVIDEOS\.COM\s*$/i, "").trim();
+  }
+  return t;
+}
+
 /** Gửi từng segment lên server, sau đó /finish → .mp4 + folder segments. */
 async function trySaveSegmentsToServer(
   segmentBuffers: ArrayBuffer[],
   sessionId: string,
+  meta: {
+    sourceUrl?: string;
+    actors?: string[];
+    tags?: string[];
+    pageTitle?: string;
+  },
 ): Promise<string | null> {
   try {
     const total = segmentBuffers.length;
@@ -495,7 +530,13 @@ async function trySaveSegmentsToServer(
     const finishRes = await fetch(`${SERVER_BASE}/finish`, {
       method: "POST",
       body: new ArrayBuffer(0),
-      headers: { "X-Session-Id": sessionId },
+      headers: {
+        "X-Session-Id": sessionId,
+        "X-Source-Url": meta.sourceUrl || "",
+        "X-Page-Title": meta.pageTitle || "",
+        "X-Actors": JSON.stringify(meta.actors || []),
+        "X-Tags": JSON.stringify(meta.tags || []),
+      },
     });
     const data = (await finishRes.json().catch(() => ({}))) as {
       ok?: boolean;
@@ -512,12 +553,23 @@ async function trySaveSegmentsToServer(
 async function trySaveToServer(
   buffer: ArrayBuffer,
   filename: string,
+  meta: {
+    sourceUrl?: string;
+    actors?: string[];
+    tags?: string[];
+    pageTitle?: string;
+  },
 ): Promise<string | null> {
   try {
     const res = await fetch(`${SERVER_BASE}/save`, {
       method: "POST",
       body: buffer,
-      headers: { "X-Filename": filename },
+      headers: {
+        "X-Filename": filename,
+        "X-Source-Url": meta.sourceUrl || "",
+        "X-Actors": JSON.stringify(meta.actors || []),
+        "X-Tags": JSON.stringify(meta.tags || []),
+      },
     });
     const data = (await res.json().catch(() => ({}))) as {
       ok?: boolean;
@@ -644,9 +696,8 @@ async function downloadHls(
     offset += c.byteLength;
   }
 
-  const safeTitle = sanitizeTitleForFilename(pageTitle);
-  const base =
-    safeTitle || `hls-download-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const shortId = Date.now().toString(36);
+  const base = `vid-${shortId}`;
   const filename = isFmp4 ? `${base}.mp4` : `${base}.ts`;
   return {
     buffer: combined.buffer,
