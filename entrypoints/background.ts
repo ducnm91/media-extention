@@ -74,6 +74,22 @@ export default defineBackground(() => {
       if (message.type === "DOWNLOAD_HLS" && message.url && sender.tab?.id) {
         lastError = null;
         const tabId = sender.tab.id;
+        const titleKey = normalizeTitleKey(message.pageTitle);
+
+        if (titleKey) {
+          if (activeDownloadTitles.has(titleKey)) {
+            lastError =
+              "Video này (theo title trang) đang được tải. Đợi tải xong rồi hãy bấm lại để tránh trùng.";
+            sendResponse(false);
+            return false;
+          }
+          if (completedDownloadTitles.has(titleKey)) {
+            lastError =
+              "Video này (theo title trang) đã được tải trước đó. Kiểm tra thư mục lưu video trước khi tải lại.";
+            sendResponse(false);
+            return false;
+          }
+        }
 
         if (
           !activeDownloadTabs.has(tabId) &&
@@ -85,6 +101,7 @@ export default defineBackground(() => {
         }
 
         activeDownloadTabs.add(tabId);
+        if (titleKey) activeDownloadTitles.add(titleKey);
         updateActionBadge();
 
         downloadHls(message.url, tabId, message.pageTitle || "")
@@ -104,6 +121,7 @@ export default defineBackground(() => {
                   )
                 : null;
             if (saved) {
+              if (titleKey) completedDownloadTitles.add(titleKey);
               try {
                 await browser.tabs.sendMessage(
                   tabId,
@@ -126,6 +144,7 @@ export default defineBackground(() => {
               result.filename,
             );
             if (fallback) {
+              if (titleKey) completedDownloadTitles.add(titleKey);
               try {
                 await browser.tabs.sendMessage(
                   tabId,
@@ -144,9 +163,10 @@ export default defineBackground(() => {
               return;
             }
             const buffer = result.buffer;
-            return sendChunksToTab(tabId, buffer, result.filename).then(() =>
-              sendResponse(true),
-            );
+            return sendChunksToTab(tabId, buffer, result.filename).then(() => {
+              if (titleKey) completedDownloadTitles.add(titleKey);
+              sendResponse(true);
+            });
           })
           .catch((err) => {
             lastError = err instanceof Error ? err.message : String(err);
@@ -154,6 +174,7 @@ export default defineBackground(() => {
           })
           .finally(() => {
             activeDownloadTabs.delete(tabId);
+            if (titleKey) activeDownloadTitles.delete(titleKey);
             updateActionBadge();
             void notifyAllDownloadsDone();
           });
@@ -396,6 +417,8 @@ const CONFIG = {
 } as const;
 
 const activeDownloadTabs = new Set<number>();
+const activeDownloadTitles = new Set<string>();
+const completedDownloadTitles = new Set<string>();
 
 function updateActionBadge() {
   const count = activeDownloadTabs.size;
@@ -432,6 +455,11 @@ function sanitizeTitleForFilename(title: string): string {
     .trim()
     .replace(/\s+/g, "_");
   return replaced.slice(0, 80);
+}
+
+function normalizeTitleKey(title: string | undefined): string {
+  if (!title) return "";
+  return title.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 /** Gửi từng segment lên server, sau đó /finish → .mp4 + folder segments. */
