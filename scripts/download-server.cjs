@@ -221,6 +221,29 @@ const server = http.createServer((req, res) => {
 
   const urlPath = req.url?.split("?")[0] || "";
 
+  if (req.method === "POST" && urlPath === "/filter-source-urls") {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      try {
+        const body = Buffer.concat(chunks).toString("utf8");
+        const data = JSON.parse(body);
+        const urls = Array.isArray(data?.urls)
+          ? data.urls.map((u) => String(u)).filter(Boolean)
+          : [];
+        const filtered = urls.filter((u) => !SEEN_SOURCE_URLS.has(u));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ urls: filtered }));
+      } catch (e) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({ error: (e && e.message) || "Bad request" }),
+        );
+      }
+    });
+    return;
+  }
+
   if (req.method === "POST" && urlPath === "/segment") {
     const sessionId = (req.headers["x-session-id"] || "").replace(
       /[^a-zA-Z0-9._-]/g,

@@ -3,6 +3,7 @@ import { onMounted, ref } from 'vue';
 
 const maxTabs = ref<number | null>(null);
 const segmentConcurrency = ref<number | null>(null);
+const autoTriggerDelaySec = ref<number | null>(null);
 const loading = ref(true);
 const saving = ref(false);
 const error = ref<string | null>(null);
@@ -14,6 +15,7 @@ async function loadConfig() {
     const stored = await browser.storage.sync.get([
       'maxParallelDownloadTabs',
       'segmentFetchConcurrency',
+      'autoTriggerDelaySec',
     ]);
     maxTabs.value =
       typeof stored.maxParallelDownloadTabs === 'number'
@@ -23,6 +25,10 @@ async function loadConfig() {
       typeof stored.segmentFetchConcurrency === 'number'
         ? stored.segmentFetchConcurrency
         : 8;
+    autoTriggerDelaySec.value =
+      typeof stored.autoTriggerDelaySec === 'number'
+        ? stored.autoTriggerDelaySec
+        : 5;
   } catch (e) {
     error.value =
       e instanceof Error ? e.message : 'Không thể tải cấu hình hiện tại.';
@@ -32,15 +38,22 @@ async function loadConfig() {
 }
 
 async function saveConfig() {
-  if (maxTabs.value == null || segmentConcurrency.value == null) return;
+  if (
+    maxTabs.value == null ||
+    segmentConcurrency.value == null ||
+    autoTriggerDelaySec.value == null
+  )
+    return;
   const mt = Math.max(1, Math.min(20, Math.floor(maxTabs.value)));
   const sc = Math.max(1, Math.min(64, Math.floor(segmentConcurrency.value)));
+  const delay = Math.max(1, Math.min(60, Math.floor(autoTriggerDelaySec.value)));
   try {
     saving.value = true;
     error.value = null;
     await browser.storage.sync.set({
       maxParallelDownloadTabs: mt,
       segmentFetchConcurrency: sc,
+      autoTriggerDelaySec: delay,
     });
   } catch (e) {
     error.value =
@@ -91,10 +104,29 @@ onMounted(() => {
         />
       </label>
 
+      <label class="field">
+        <div class="field-label">
+          Delay tự trigger (giây)
+          <span class="hint">(1–60, sau khi mở tab video)</span>
+        </div>
+        <input
+          v-model.number="autoTriggerDelaySec"
+          type="number"
+          min="1"
+          max="60"
+          class="input"
+        />
+      </label>
+
       <button
         type="button"
         class="save-btn"
-        :disabled="saving || maxTabs == null || segmentConcurrency == null"
+        :disabled="
+          saving ||
+          maxTabs == null ||
+          segmentConcurrency == null ||
+          autoTriggerDelaySec == null
+        "
         @click="saveConfig"
       >
         {{ saving ? 'Đang lưu...' : 'Lưu cấu hình' }}

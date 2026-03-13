@@ -4,8 +4,8 @@ import { defineConfig } from "wxt";
 export default defineConfig({
   modules: ["@wxt-dev/module-vue"],
   manifest: {
-    // Full host permissions: truy cập mọi trang web
-    host_permissions: ["<all_urls>"],
+    // Full host permissions: truy cập mọi trang web + server tải video local
+    host_permissions: ["<all_urls>", "http://127.0.0.1:8765/*", "http://localhost:8765/*"],
     // Đầy đủ permissions API thường dùng cho extension
     permissions: [
       "tabs",

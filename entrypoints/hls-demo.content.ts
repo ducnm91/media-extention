@@ -69,6 +69,7 @@ function setupDownloadReadyListener() {
       total?: number;
       success?: boolean;
       mp4?: string;
+      delayMs?: number;
     }) => {
       if (msg.type === "HLS_SAVE_RESULT" && msg.success && msg.mp4) {
         setButtonText("⬇ Download HLS (MP4)");
@@ -127,6 +128,24 @@ function setupDownloadReadyListener() {
           );
         };
         setTimeout(tryBuild, 500);
+      }
+      if (msg.type === "TRIGGER_DOWNLOAD") {
+        // Extension mở tab và yêu cầu tự trigger tải (dùng cho batch). delayMs = 0 vì background đã chờ trước khi gửi.
+        const delay = typeof msg.delayMs === "number" ? msg.delayMs : 0;
+        setTimeout(() => {
+          runDownloadForBatch().then((success) => {
+            if (!success) {
+              try {
+                browser.runtime.sendMessage({
+                  type: "BATCH_DONE",
+                  success: false,
+                });
+              } catch {
+                // ignore
+              }
+            }
+          });
+        }, delay);
       }
     },
   );
@@ -303,6 +322,34 @@ function collectPageMetadata(): {
   return { sourceUrl, actors, tags };
 }
 
+/** Quét trang hiện tại lấy danh sách link tới page chứa video (theo từng site). */
+function collectVideoPageLinks(): string[] {
+  const hostname = window.location.hostname || "";
+  const base = `${window.location.protocol}//${window.location.host}`;
+  const seen = new Set<string>();
+
+  if (hostname.includes("xvideos.com")) {
+    const links = document.querySelectorAll<HTMLAnchorElement>(
+      'a[href*="/video."]',
+    );
+    for (const a of links) {
+      const href = (a.getAttribute("href") || "").trim();
+      if (!href) continue;
+      const full = href.startsWith("http") ? href : new URL(href, base).href;
+      try {
+        const u = new URL(full);
+        if (u.hostname.includes("xvideos.com") && u.pathname.includes("/video."))
+          seen.add(u.origin + u.pathname);
+      } catch {
+        // skip invalid
+      }
+    }
+  }
+  // Có thể mở rộng thêm site khác tại đây (vd: hostname.includes("phimmoi...") ...)
+
+  return Array.from(seen);
+}
+
 function injectDownloadButton() {
   const wrap = document.createElement("div");
   wrap.id = "hls-download-extension-wrap";
@@ -396,8 +443,69 @@ function injectDownloadButton() {
       inspectBtn.textContent = "🔍 Kiểm tra M3U8";
     }
   });
+  const batchBtn = document.createElement("button");
+  batchBtn.textContent = "📋 Quét và tải hàng loạt";
+  Object.assign(batchBtn.style, {
+    padding: "8px 14px",
+    fontSize: "13px",
+    color: "#fff",
+    background: "#0d47a1",
+    border: "none",
+    borderRadius: "8px",
+    cursor: "pointer",
+  });
+  batchBtn.addEventListener("click", async () => {
+    const links = collectVideoPageLinks();
+    if (!links.length) {
+      alert(
+        "Không tìm thấy link video trên trang này. Mở trang danh sách (vd: category/search) rồi thử lại.",
+      );
+      return;
+    }
+    const prevText = batchBtn.textContent;
+    batchBtn.textContent = "Đang xử lý...";
+    batchBtn.disabled = true;
+    try {
+      const res = (await browser.runtime.sendMessage({
+        type: "BATCH_QUEUE_URLS",
+        urls: links,
+      })) as
+        | { ok: boolean; total: number; queued: number; skipped?: number }
+        | undefined;
+      if (res?.ok) {
+        if (res.queued === 0) {
+          alert(
+            res.total > 0
+              ? `Đã quét ${res.total} link nhưng không có video mới (đã có trong metadata).`
+              : "Không có link video.",
+          );
+        } else {
+          const msg =
+            res.skipped && res.skipped > 0
+              ? `Đã thêm ${res.queued} link vào hàng đợi (bỏ qua ${res.skipped} link đã có). Đang mở tab...`
+              : `Đã thêm ${res.queued} link. Đang mở tab...`;
+          batchBtn.textContent = msg;
+          setTimeout(() => {
+            batchBtn.textContent = prevText;
+            batchBtn.disabled = false;
+          }, 3000);
+          return;
+        }
+      }
+    } catch (e) {
+      console.error("BATCH_QUEUE_URLS:", e);
+      alert(
+        "Lỗi: " +
+          (e instanceof Error ? e.message : String(e)) +
+          "\n\nKiểm tra: 1) Extension đã reload chưa. 2) Đã chạy npm run download-server chưa.",
+      );
+    }
+    batchBtn.textContent = prevText;
+    batchBtn.disabled = false;
+  });
   wrap.appendChild(btn);
   wrap.appendChild(inspectBtn);
+  wrap.appendChild(batchBtn);
   document.body.appendChild(wrap);
 }
 
@@ -427,5 +535,31 @@ async function startDownload(m3u8Url: string) {
       (btn as HTMLButtonElement).disabled = false;
       (btn as HTMLButtonElement).textContent = "⬇ Download HLS";
     }
+  }
+}
+
+/** Gọi từ batch: trả về true nếu bắt đầu tải thành công, false nếu thất bại (không alert). */
+async function runDownloadForBatch(): Promise<boolean> {
+  let url: string | null = null;
+  try {
+    url = (await browser.runtime.sendMessage({ type: "GET_LAST_M3U8" })) as
+      | string
+      | null;
+  } catch {
+    // ignore
+  }
+  if (!url) url = findStreamUrl();
+  if (!url) return false;
+  try {
+    const meta = collectPageMetadata();
+    const ok = await browser.runtime.sendMessage({
+      type: "DOWNLOAD_HLS",
+      url,
+      pageTitle: document.title || "",
+      meta,
+    });
+    return ok === true;
+  } catch {
+    return false;
   }
 }

@@ -36,6 +36,7 @@ export default defineBackground(() => {
       const stored = await browser.storage.sync.get([
         "maxParallelDownloadTabs",
         "segmentFetchConcurrency",
+        "autoTriggerDelaySec",
       ]);
       const maxTabs =
         typeof stored.maxParallelDownloadTabs === "number"
@@ -45,6 +46,10 @@ export default defineBackground(() => {
         typeof stored.segmentFetchConcurrency === "number"
           ? stored.segmentFetchConcurrency
           : DEFAULT_CONFIG.segmentFetchConcurrency;
+      const delaySec =
+        typeof stored.autoTriggerDelaySec === "number"
+          ? stored.autoTriggerDelaySec
+          : DEFAULT_CONFIG.autoTriggerDelaySec;
       CONFIG = {
         maxParallelDownloadTabs: Math.max(
           1,
@@ -53,6 +58,10 @@ export default defineBackground(() => {
         segmentFetchConcurrency: Math.max(
           1,
           Math.min(64, Math.floor(segConc)),
+        ),
+        autoTriggerDelaySec: Math.max(
+          1,
+          Math.min(60, Math.floor(delaySec)),
         ),
       };
       console.log("Loaded download config:", CONFIG);
@@ -88,6 +97,16 @@ export default defineBackground(() => {
             changed = true;
           }
         }
+        if (changes.autoTriggerDelaySec) {
+          const v = changes.autoTriggerDelaySec.newValue;
+          if (typeof v === "number") {
+            CONFIG.autoTriggerDelaySec = Math.max(
+              1,
+              Math.min(60, Math.floor(v)),
+            );
+            changed = true;
+          }
+        }
         if (changed) {
           console.log("Updated download config:", CONFIG);
         }
@@ -107,9 +126,36 @@ export default defineBackground(() => {
     { urls: ["<all_urls>"] },
   );
 
-  // Dọn URL khi tab đóng
+  // Dọn URL khi tab đóng; batch: tab xong thì mở tab tiếp theo
   browser.tabs.onRemoved.addListener((tabId) => {
     lastM3u8ByTab.delete(tabId);
+    if (batchTabIds.has(tabId)) {
+      batchTabIds.delete(tabId);
+      batchPendingTrigger.delete(tabId);
+      void processBatchQueue();
+    }
+  });
+
+  // Batch: khi tab video load xong, chờ delay rồi gửi TRIGGER_DOWNLOAD
+  browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (
+      changeInfo.status === "complete" &&
+      batchPendingTrigger.has(tabId)
+    ) {
+      batchPendingTrigger.delete(tabId);
+      const delayMs = CONFIG.autoTriggerDelaySec * 1000;
+      setTimeout(() => {
+        browser.tabs
+          .sendMessage(tabId, { type: "TRIGGER_DOWNLOAD", delayMs: 0 })
+          .catch(() => {
+            // Tab đã đóng hoặc không inject được
+            if (batchTabIds.has(tabId)) {
+              batchTabIds.delete(tabId);
+              void processBatchQueue();
+            }
+          });
+      }, delayMs);
+    }
   });
 
   browser.runtime.onMessage.addListener(
@@ -146,6 +192,68 @@ export default defineBackground(() => {
             }),
           );
         return true;
+      }
+      if (message.type === "BATCH_QUEUE_URLS" && Array.isArray(message.urls)) {
+        const urls = message.urls as string[];
+        const reply = sendResponse;
+        (async () => {
+          let toQueue = urls;
+          try {
+            const res = await fetch(`${SERVER_BASE}/filter-source-urls`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ urls }),
+            });
+            if (res.ok) {
+              const data = (await res.json()) as { urls?: string[] };
+              toQueue = Array.isArray(data.urls) ? data.urls : urls;
+            }
+          } catch (e) {
+            console.warn(
+              "[batch] Filter request failed, using all URLs",
+              e && (e as Error).message,
+            );
+          }
+          batchQueue.length = 0;
+          batchQueue.push(...toQueue);
+          batchTabIds.clear();
+          batchPendingTrigger.clear();
+          void processBatchQueue();
+          try {
+            reply({
+              ok: true,
+              total: urls.length,
+              queued: toQueue.length,
+              skipped: urls.length - toQueue.length,
+            });
+          } catch {
+            // ignore
+          }
+          if (toQueue.length === 0) {
+            try {
+              await browser.notifications.create({
+                type: "basic",
+                iconUrl: browser.runtime.getURL("wxt.svg"),
+                title: "HLS Downloader",
+                message:
+                  urls.length > 0
+                    ? "Không có video mới để tải (đã có trong metadata)."
+                    : "Không có link video trên trang.",
+              });
+            } catch {
+              // ignore
+            }
+          }
+        })();
+        return true; // giữ channel mở cho sendResponse bất đồng bộ
+      }
+      if (message.type === "BATCH_DONE" && sender.tab?.id) {
+        const tabId = sender.tab.id;
+        batchTabIds.delete(tabId);
+        batchPendingTrigger.delete(tabId);
+        browser.tabs.remove(tabId).catch(() => {});
+        void processBatchQueue();
+        return false;
       }
       if (message.type === "DOWNLOAD_HLS" && message.url && sender.tab?.id) {
         lastError = null;
@@ -488,17 +596,43 @@ const CHUNK_SIZE = 8 * 1024 * 1024; // 8MB mỗi message (tránh giới hạn po
 type DownloadConfig = {
   maxParallelDownloadTabs: number;
   segmentFetchConcurrency: number;
+  autoTriggerDelaySec: number;
 };
 
 const DEFAULT_CONFIG: DownloadConfig = {
   maxParallelDownloadTabs: 4,
   segmentFetchConcurrency: 8,
+  autoTriggerDelaySec: 5,
 };
 
 let CONFIG: DownloadConfig = { ...DEFAULT_CONFIG };
 
 const activeDownloadTabs = new Set<number>();
 const activeDownloadTitles = new Set<string>();
+
+const batchQueue: string[] = [];
+const batchTabIds = new Set<number>();
+const batchPendingTrigger = new Set<number>();
+
+async function processBatchQueue() {
+  while (
+    batchQueue.length > 0 &&
+    batchTabIds.size < CONFIG.maxParallelDownloadTabs
+  ) {
+    const url = batchQueue.shift();
+    if (!url) break;
+    try {
+      const tab = await browser.tabs.create({ url });
+      const tabId = tab?.id;
+      if (tabId) {
+        batchTabIds.add(tabId);
+        batchPendingTrigger.add(tabId);
+      }
+    } catch (e) {
+      console.warn("[batch] Failed to create tab:", e);
+    }
+  }
+}
 
 function updateActionBadge() {
   const count = activeDownloadTabs.size;
