@@ -132,29 +132,52 @@ export default defineBackground(() => {
     if (batchTabIds.has(tabId)) {
       batchTabIds.delete(tabId);
       batchPendingTrigger.delete(tabId);
+      batchTabIdToExtraMeta.delete(tabId);
       void processBatchQueue();
+    }
+    if (updateTabIds.has(tabId)) {
+      updateTabIds.delete(tabId);
+      updatePendingTrigger.delete(tabId);
+      updateTabIdToItem.delete(tabId);
+      void processUpdateQueue();
     }
   });
 
-  // Batch: khi tab video load xong, chờ delay rồi gửi TRIGGER_DOWNLOAD
+  // Batch: khi tab video load xong, chờ delay rồi gửi TRIGGER_DOWNLOAD hoặc TRIGGER_UPDATE_METADATA
   browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
-    if (
-      changeInfo.status === "complete" &&
-      batchPendingTrigger.has(tabId)
-    ) {
+    if (changeInfo.status !== "complete") return;
+    if (batchPendingTrigger.has(tabId)) {
       batchPendingTrigger.delete(tabId);
       const delayMs = CONFIG.autoTriggerDelaySec * 1000;
       setTimeout(() => {
         browser.tabs
-          .sendMessage(tabId, { type: "TRIGGER_DOWNLOAD", delayMs: 0 })
+          .sendMessage(tabId, {
+            type: "TRIGGER_DOWNLOAD",
+            delayMs: 0,
+            tabId,
+          })
           .catch(() => {
-            // Tab đã đóng hoặc không inject được
             if (batchTabIds.has(tabId)) {
               batchTabIds.delete(tabId);
               void processBatchQueue();
             }
           });
       }, delayMs);
+      return;
+    }
+    if (updatePendingTrigger.has(tabId)) {
+      updatePendingTrigger.delete(tabId);
+      setTimeout(() => {
+        browser.tabs
+          .sendMessage(tabId, { type: "TRIGGER_UPDATE_METADATA", tabId })
+          .catch(() => {
+            if (updateTabIds.has(tabId)) {
+              updateTabIds.delete(tabId);
+              updateTabIdToItem.delete(tabId);
+              void processUpdateQueue();
+            }
+          });
+      }, 3000);
     }
   });
 
@@ -164,6 +187,9 @@ export default defineBackground(() => {
         type: string;
         url?: string;
         pageTitle?: string;
+        tabId?: number;
+        sourceUrl?: string;
+        views?: string;
         meta?: {
           sourceUrl?: string;
           actors?: string[];
@@ -177,6 +203,10 @@ export default defineBackground(() => {
       if (message.type === "GET_LAST_ERROR") {
         sendResponse(lastError ?? "");
         return true;
+      }
+      if (message.type === "GET_BATCH_QUEUE_COUNT") {
+        sendResponse({ count: batchQueue.length });
+        return false;
       }
       if (message.type === "GET_LAST_M3U8" && sender.tab?.id) {
         const url = lastM3u8ByTab.get(sender.tab.id) ?? null;
@@ -193,11 +223,17 @@ export default defineBackground(() => {
           );
         return true;
       }
-      if (message.type === "BATCH_QUEUE_URLS" && Array.isArray(message.urls)) {
-        const urls = message.urls as string[];
+      if (
+        message.type === "BATCH_QUEUE_URLS" &&
+        (Array.isArray(message.items) || Array.isArray(message.urls))
+      ) {
+        const items: BatchItem[] = Array.isArray(message.items)
+          ? (message.items as BatchItem[])
+          : (message.urls as string[]).map((url: string) => ({ url }));
+        const urls = items.map((i) => i.url);
         const reply = sendResponse;
         (async () => {
-          let toQueue = urls;
+          let filteredUrls = urls;
           try {
             const res = await fetch(`${SERVER_BASE}/filter-source-urls`, {
               method: "POST",
@@ -205,8 +241,25 @@ export default defineBackground(() => {
               body: JSON.stringify({ urls }),
             });
             if (res.ok) {
-              const data = (await res.json()) as { urls?: string[] };
-              toQueue = Array.isArray(data.urls) ? data.urls : urls;
+              const data = (await res.json()) as {
+                urls?: string[];
+                updateUrls?: string[];
+              };
+              filteredUrls = Array.isArray(data.urls) ? data.urls : urls;
+              const updateUrls = Array.isArray(data.updateUrls)
+                ? data.updateUrls
+                : [];
+              const existingUpdateUrls = new Set(updateQueue.map((i) => i.url));
+              for (const url of updateUrls) {
+                if (!existingUpdateUrls.has(url)) {
+                  updateQueue.push({
+                    url,
+                    thumbnailUrl: items.find((i) => i.url === url)?.thumbnailUrl,
+                  });
+                  existingUpdateUrls.add(url);
+                }
+              }
+              void processUpdateQueue();
             }
           } catch (e) {
             console.warn(
@@ -214,31 +267,39 @@ export default defineBackground(() => {
               e && (e as Error).message,
             );
           }
-          batchQueue.length = 0;
-          batchQueue.push(...toQueue);
-          batchTabIds.clear();
-          batchPendingTrigger.clear();
+          const toQueue: BatchItem[] = filteredUrls.map((url) => ({
+            url,
+            thumbnailUrl: items.find((i) => i.url === url)?.thumbnailUrl,
+          }));
+          const existingUrls = new Set(batchQueue.map((i) => i.url));
+          let newlyAdded = 0;
+          for (const item of toQueue) {
+            if (!existingUrls.has(item.url)) {
+              batchQueue.push(item);
+              existingUrls.add(item.url);
+              newlyAdded++;
+            }
+          }
           void processBatchQueue();
           try {
             reply({
               ok: true,
               total: urls.length,
-              queued: toQueue.length,
+              queued: newlyAdded,
               skipped: urls.length - toQueue.length,
+              totalInQueue: batchQueue.length,
             });
           } catch {
             // ignore
           }
-          if (toQueue.length === 0) {
+          if (newlyAdded === 0 && toQueue.length === 0 && urls.length > 0) {
             try {
               await browser.notifications.create({
                 type: "basic",
                 iconUrl: browser.runtime.getURL("wxt.svg"),
                 title: "HLS Downloader",
                 message:
-                  urls.length > 0
-                    ? "Không có video mới để tải (đã có trong metadata)."
-                    : "Không có link video trên trang.",
+                  "Không có video mới để tải (đã có trong metadata).",
               });
             } catch {
               // ignore
@@ -247,10 +308,54 @@ export default defineBackground(() => {
         })();
         return true; // giữ channel mở cho sendResponse bất đồng bộ
       }
-      if (message.type === "BATCH_DONE" && sender.tab?.id) {
-        const tabId = sender.tab.id;
+      if (message.type === "UPDATE_METADATA") {
+        const tabId =
+          typeof message.tabId === "number"
+            ? message.tabId
+            : sender.tab?.id;
+        if (tabId == null) return false;
+        const item = updateTabIdToItem.get(tabId);
+        const sourceUrl =
+          typeof message.sourceUrl === "string" && message.sourceUrl.trim()
+            ? message.sourceUrl.trim()
+            : item?.url;
+        const views =
+          typeof message.views === "string" ? message.views.trim() : "";
+        (async () => {
+          try {
+            await fetch(`${SERVER_BASE}/update-metadata`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                sourceUrl: sourceUrl || "",
+                thumbnailUrl: item?.thumbnailUrl || "",
+                views: views || undefined,
+              }),
+            });
+          } catch (e) {
+            console.warn("[update-metadata] request failed", e);
+          }
+          updateTabIds.delete(tabId);
+          updatePendingTrigger.delete(tabId);
+          updateTabIdToItem.delete(tabId);
+          try {
+            await browser.tabs.remove(tabId);
+          } catch {
+            // ignore
+          }
+          void processUpdateQueue();
+        })();
+        return false;
+      }
+      if (message.type === "BATCH_DONE") {
+        const tabId =
+          typeof message.tabId === "number"
+            ? message.tabId
+            : sender.tab?.id;
+        if (tabId == null) return false;
         batchTabIds.delete(tabId);
         batchPendingTrigger.delete(tabId);
+        batchTabIdToExtraMeta.delete(tabId);
         browser.tabs.remove(tabId).catch(() => {});
         void processBatchQueue();
         return false;
@@ -298,12 +403,17 @@ export default defineBackground(() => {
             const sessionId = result.filename
               .replace(/\.ts$/i, "")
               .replace(/\.mp4$/i, "");
+            const extra = batchTabIdToExtraMeta.get(tabId);
+            const metaWithThumb = {
+              ...meta,
+              thumbnailUrl: extra?.thumbnailUrl,
+            };
             const saved =
               result.segmentBuffers.length > 0
                 ? await trySaveSegmentsToServer(
                     result.segmentBuffers,
                     sessionId,
-                    meta,
+                    metaWithThumb,
                   )
                 : null;
             if (saved) {
@@ -327,7 +437,7 @@ export default defineBackground(() => {
             const fallback = await trySaveToServer(
               result.buffer,
               result.filename,
-              meta,
+              metaWithThumb,
             );
             if (fallback) {
               try {
@@ -355,10 +465,18 @@ export default defineBackground(() => {
           .catch((err) => {
             lastError = err instanceof Error ? err.message : String(err);
             sendResponse(false);
+            if (batchTabIds.has(tabId)) {
+              batchTabIds.delete(tabId);
+              batchPendingTrigger.delete(tabId);
+              batchTabIdToExtraMeta.delete(tabId);
+              browser.tabs.remove(tabId).catch(() => {});
+              void processBatchQueue();
+            }
           })
           .finally(() => {
             activeDownloadTabs.delete(tabId);
             if (titleKey) activeDownloadTitles.delete(titleKey);
+            batchTabIdToExtraMeta.delete(tabId);
             updateActionBadge();
             void notifyAllDownloadsDone();
           });
@@ -610,27 +728,56 @@ let CONFIG: DownloadConfig = { ...DEFAULT_CONFIG };
 const activeDownloadTabs = new Set<number>();
 const activeDownloadTitles = new Set<string>();
 
-const batchQueue: string[] = [];
+type BatchItem = { url: string; thumbnailUrl?: string };
+const batchQueue: BatchItem[] = [];
 const batchTabIds = new Set<number>();
 const batchPendingTrigger = new Set<number>();
+const batchTabIdToExtraMeta = new Map<number, { thumbnailUrl?: string }>();
+
+const updateQueue: BatchItem[] = [];
+const updateTabIds = new Set<number>();
+const updatePendingTrigger = new Set<number>();
+const updateTabIdToItem = new Map<number, BatchItem>();
 
 async function processBatchQueue() {
   while (
     batchQueue.length > 0 &&
     batchTabIds.size < CONFIG.maxParallelDownloadTabs
   ) {
-    const url = batchQueue.shift();
-    if (!url) break;
+    const item = batchQueue.shift();
+    if (!item) break;
     try {
-      const tab = await browser.tabs.create({ url });
+      const tab = await browser.tabs.create({ url: item.url });
       const tabId = tab?.id;
       if (tabId) {
         batchTabIds.add(tabId);
         batchPendingTrigger.add(tabId);
+        batchTabIdToExtraMeta.set(tabId, {
+          thumbnailUrl: item.thumbnailUrl,
+        });
       }
     } catch (e) {
       console.warn("[batch] Failed to create tab:", e);
     }
+  }
+}
+
+async function processUpdateQueue() {
+  if (updateQueue.length === 0 || updateTabIds.size >= CONFIG.maxParallelDownloadTabs)
+    return;
+  const item = updateQueue.shift();
+  if (!item) return;
+  try {
+    const tab = await browser.tabs.create({ url: item.url });
+    const tabId = tab?.id;
+    if (tabId) {
+      updateTabIds.add(tabId);
+      updatePendingTrigger.add(tabId);
+      updateTabIdToItem.set(tabId, item);
+    }
+  } catch (e) {
+    console.warn("[update] Failed to create tab:", e);
+    void processUpdateQueue();
   }
 }
 
@@ -705,6 +852,8 @@ async function trySaveSegmentsToServer(
     actors?: string[];
     tags?: string[];
     pageTitle?: string;
+    views?: string;
+    thumbnailUrl?: string;
   },
 ): Promise<string | null> {
   try {
@@ -741,6 +890,12 @@ async function trySaveSegmentsToServer(
         "X-Page-Title": meta.pageTitle || "",
         "X-Actors": JSON.stringify(meta.actors || []),
         "X-Tags": JSON.stringify(meta.tags || []),
+        ...(meta.views !== undefined && meta.views !== ""
+          ? { "X-Views": String(meta.views) }
+          : {}),
+        ...(meta.thumbnailUrl
+          ? { "X-Thumbnail-Url": meta.thumbnailUrl }
+          : {}),
       },
     });
     const data = (await finishRes.json().catch(() => ({}))) as {
@@ -763,6 +918,8 @@ async function trySaveToServer(
     actors?: string[];
     tags?: string[];
     pageTitle?: string;
+    views?: string;
+    thumbnailUrl?: string;
   },
 ): Promise<string | null> {
   try {
@@ -772,8 +929,15 @@ async function trySaveToServer(
       headers: {
         "X-Filename": filename,
         "X-Source-Url": meta.sourceUrl || "",
+        "X-Page-Title": meta.pageTitle || "",
         "X-Actors": JSON.stringify(meta.actors || []),
         "X-Tags": JSON.stringify(meta.tags || []),
+        ...(meta.views !== undefined && meta.views !== ""
+          ? { "X-Views": String(meta.views) }
+          : {}),
+        ...(meta.thumbnailUrl
+          ? { "X-Thumbnail-Url": meta.thumbnailUrl }
+          : {}),
       },
     });
     const data = (await res.json().catch(() => ({}))) as {

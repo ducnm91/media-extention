@@ -11,6 +11,10 @@ export default defineContentScript({
 let downloadChunksByIndex: (ArrayBuffer | null)[] = [];
 let downloadFilename = "";
 let downloadTotalChunks = 0;
+/** Tab này được mở bởi batch (nhận TRIGGER_DOWNLOAD) → khi lỗi gửi BATCH_DONE để đóng tab. */
+let isBatchTab = false;
+/** Tab ID do background gửi kèm TRIGGER_DOWNLOAD, dùng để gửi lại trong BATCH_DONE (tránh sender.tab undefined). */
+let batchTabId: number | undefined;
 
 function normalizeChunkBuffer(buf: unknown): ArrayBuffer | null {
   if (buf instanceof ArrayBuffer) return buf;
@@ -70,6 +74,7 @@ function setupDownloadReadyListener() {
       success?: boolean;
       mp4?: string;
       delayMs?: number;
+      tabId?: number;
     }) => {
       if (msg.type === "HLS_SAVE_RESULT" && msg.success && msg.mp4) {
         setButtonText("⬇ Download HLS (MP4)");
@@ -123,6 +128,17 @@ function setupDownloadReadyListener() {
           downloadFilename = "";
           downloadTotalChunks = 0;
           setButtonText("⬇ Download HLS (MP4)");
+          if (isBatchTab) {
+            try {
+              browser.runtime.sendMessage({
+                type: "BATCH_DONE",
+                success: false,
+                tabId: batchTabId,
+              });
+            } catch {
+              // ignore
+            }
+          }
           alert(
             `Lỗi tải video (thiếu dữ liệu: ${ready}/${total}). Thử lại hoặc chọn stream khác.`,
           );
@@ -130,6 +146,8 @@ function setupDownloadReadyListener() {
         setTimeout(tryBuild, 500);
       }
       if (msg.type === "TRIGGER_DOWNLOAD") {
+        isBatchTab = true;
+        batchTabId = msg.tabId;
         // Extension mở tab và yêu cầu tự trigger tải (dùng cho batch). delayMs = 0 vì background đã chờ trước khi gửi.
         const delay = typeof msg.delayMs === "number" ? msg.delayMs : 0;
         setTimeout(() => {
@@ -139,6 +157,7 @@ function setupDownloadReadyListener() {
                 browser.runtime.sendMessage({
                   type: "BATCH_DONE",
                   success: false,
+                  tabId: batchTabId,
                 });
               } catch {
                 // ignore
@@ -146,6 +165,23 @@ function setupDownloadReadyListener() {
             }
           });
         }, delay);
+      }
+      if (msg.type === "TRIGGER_UPDATE_METADATA") {
+        const meta = collectPageMetadata();
+        const tabId =
+          typeof (msg as { tabId?: number }).tabId === "number"
+            ? (msg as { tabId?: number }).tabId
+            : undefined;
+        try {
+          browser.runtime.sendMessage({
+            type: "UPDATE_METADATA",
+            sourceUrl: meta.sourceUrl,
+            views: meta.views,
+            tabId,
+          });
+        } catch {
+          // ignore
+        }
       }
     },
   );
@@ -297,12 +333,14 @@ function collectPageMetadata(): {
   sourceUrl: string;
   actors: string[];
   tags: string[];
+  views?: string;
 } {
   const sourceUrl = window.location.href;
   const hostname = window.location.hostname || "";
 
   let actors: string[] = [];
   let tags: string[] = [];
+  let views: string | undefined;
 
   if (hostname.includes("xvideos.com")) {
     actors = Array.from(
@@ -317,16 +355,26 @@ function collectPageMetadata(): {
     )
       .map((el) => (el.textContent || "").trim())
       .filter((v) => v.length > 0);
+    const viewsEl = document.querySelector<HTMLElement>(
+      "#v-views strong.mobile-hide",
+    );
+    if (viewsEl) {
+      const raw = (viewsEl.textContent || "").trim().replace(/,/g, "");
+      if (raw) views = raw;
+    }
   }
 
-  return { sourceUrl, actors, tags };
+  return { sourceUrl, actors, tags, views };
 }
 
-/** Quét trang hiện tại lấy danh sách link tới page chứa video (theo từng site). */
-function collectVideoPageLinks(): string[] {
+/** Item: url trang video + thumbnail từ img trong thẻ a (để server tải ảnh và lưu path). */
+type VideoPageItem = { url: string; thumbnailUrl?: string };
+
+/** Quét trang hiện tại lấy danh sách link tới page chứa video + thumbnail (theo từng site). */
+function collectVideoPageLinks(): VideoPageItem[] {
   const hostname = window.location.hostname || "";
   const base = `${window.location.protocol}//${window.location.host}`;
-  const seen = new Set<string>();
+  const seen = new Map<string, string>(); // url canonical -> thumbnailUrl
 
   if (hostname.includes("xvideos.com")) {
     const links = document.querySelectorAll<HTMLAnchorElement>(
@@ -338,16 +386,25 @@ function collectVideoPageLinks(): string[] {
       const full = href.startsWith("http") ? href : new URL(href, base).href;
       try {
         const u = new URL(full);
-        if (u.hostname.includes("xvideos.com") && u.pathname.includes("/video."))
-          seen.add(u.origin + u.pathname);
+        if (
+          u.hostname.includes("xvideos.com") &&
+          u.pathname.includes("/video.")
+        ) {
+          const canonical = u.origin + u.pathname;
+          const img = a.querySelector("img");
+          const thumb = img?.getAttribute("src")?.trim();
+          if (thumb && !seen.has(canonical)) seen.set(canonical, thumb);
+          else if (!seen.has(canonical)) seen.set(canonical, "");
+        }
       } catch {
         // skip invalid
       }
     }
   }
-  // Có thể mở rộng thêm site khác tại đây (vd: hostname.includes("phimmoi...") ...)
-
-  return Array.from(seen);
+  return Array.from(seen.entries()).map(([url, thumbnailUrl]) => ({
+    url,
+    thumbnailUrl: thumbnailUrl || undefined,
+  }));
 }
 
 function injectDownloadButton() {
@@ -455,8 +512,8 @@ function injectDownloadButton() {
     cursor: "pointer",
   });
   batchBtn.addEventListener("click", async () => {
-    const links = collectVideoPageLinks();
-    if (!links.length) {
+    const items = collectVideoPageLinks();
+    if (!items.length) {
       alert(
         "Không tìm thấy link video trên trang này. Mở trang danh sách (vd: category/search) rồi thử lại.",
       );
@@ -468,22 +525,26 @@ function injectDownloadButton() {
     try {
       const res = (await browser.runtime.sendMessage({
         type: "BATCH_QUEUE_URLS",
-        urls: links,
+        items,
       })) as
         | { ok: boolean; total: number; queued: number; skipped?: number }
         | undefined;
       if (res?.ok) {
-        if (res.queued === 0) {
+        if (res.queued === 0 && (res.totalInQueue ?? 0) === 0) {
           alert(
             res.total > 0
               ? `Đã quét ${res.total} link nhưng không có video mới (đã có trong metadata).`
               : "Không có link video.",
           );
         } else {
+          const totalInQueue =
+            typeof res.totalInQueue === "number" ? res.totalInQueue : res.queued;
           const msg =
-            res.skipped && res.skipped > 0
-              ? `Đã thêm ${res.queued} link vào hàng đợi (bỏ qua ${res.skipped} link đã có). Đang mở tab...`
-              : `Đã thêm ${res.queued} link. Đang mở tab...`;
+            res.queued === 0
+              ? `Hàng đợi: ${totalInQueue} link (trang này không thêm mới).`
+              : res.skipped && res.skipped > 0
+                ? `Đã thêm ${res.queued} link. Tổng hàng đợi: ${totalInQueue}. Đang mở tab...`
+                : `Đã thêm ${res.queued} link. Tổng hàng đợi: ${totalInQueue}. Đang mở tab...`;
           batchBtn.textContent = msg;
           setTimeout(() => {
             batchBtn.textContent = prevText;
@@ -538,17 +599,26 @@ async function startDownload(m3u8Url: string) {
   }
 }
 
-/** Gọi từ batch: trả về true nếu bắt đầu tải thành công, false nếu thất bại (không alert). */
+const BATCH_M3U8_RETRY_MS = 3000;
+const BATCH_M3U8_MAX_ATTEMPTS = 5;
+
+/** Gọi từ batch: trả về true nếu bắt đầu tải thành công, false nếu thất bại (không alert). Có retry vì player có thể chưa request M3U8 ngay. */
 async function runDownloadForBatch(): Promise<boolean> {
   let url: string | null = null;
-  try {
-    url = (await browser.runtime.sendMessage({ type: "GET_LAST_M3U8" })) as
-      | string
-      | null;
-  } catch {
-    // ignore
+  for (let attempt = 0; attempt < BATCH_M3U8_MAX_ATTEMPTS; attempt++) {
+    try {
+      url = (await browser.runtime.sendMessage({ type: "GET_LAST_M3U8" })) as
+        | string
+        | null;
+    } catch {
+      // ignore
+    }
+    if (!url) url = findStreamUrl();
+    if (url) break;
+    if (attempt < BATCH_M3U8_MAX_ATTEMPTS - 1) {
+      await new Promise((r) => setTimeout(r, BATCH_M3U8_RETRY_MS));
+    }
   }
-  if (!url) url = findStreamUrl();
   if (!url) return false;
   try {
     const meta = collectPageMetadata();

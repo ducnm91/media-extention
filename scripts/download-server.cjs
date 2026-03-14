@@ -11,6 +11,7 @@
  *   POST /save     body=.ts đã gộp  → convert → .mp4 vào download/ (fallback)
  */
 const http = require("http");
+const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -21,6 +22,7 @@ const PORT = 8765;
 const ROOT = path.join(__dirname, "..");
 const OUTPUT_DIR = process.env.DOWNLOAD_DIR || path.join(ROOT, "download");
 const META_FILE = path.join(OUTPUT_DIR, "videos-metadata.jsonl");
+const THUMBNAILS_DIR = path.join(OUTPUT_DIR, "thumbnails");
 const TEMP_DIR = path.join(os.tmpdir(), "hls-extension-download");
 
 if (!fs.existsSync(OUTPUT_DIR)) {
@@ -65,6 +67,21 @@ function getFfmpegPath() {
 
 const FFMPEG_PATH = getFfmpegPath();
 const SEEN_SOURCE_URLS = new Set();
+/** sourceUrl (đã chuẩn hóa) có trong metadata nhưng thiếu thumbnailPath hoặc views → cần cập nhật bổ sung */
+const NEEDS_UPDATE_SOURCE_URLS = new Set();
+
+/** Chuẩn hóa URL để so sánh "cùng video": chỉ dùng origin + pathname (bỏ query, hash). */
+function normalizeSourceUrl(url) {
+  if (!url || typeof url !== "string") return "";
+  const s = url.trim();
+  if (!s) return "";
+  try {
+    const u = new URL(s);
+    return u.origin + u.pathname;
+  } catch {
+    return s;
+  }
+}
 
 try {
   if (fs.existsSync(META_FILE)) {
@@ -75,7 +92,13 @@ try {
       try {
         const obj = JSON.parse(trimmed);
         if (obj && typeof obj.sourceUrl === "string" && obj.sourceUrl) {
-          SEEN_SOURCE_URLS.add(obj.sourceUrl);
+          const key = normalizeSourceUrl(obj.sourceUrl);
+          if (key) {
+            SEEN_SOURCE_URLS.add(key);
+            const hasThumb = obj.thumbnailPath != null && String(obj.thumbnailPath).trim() !== "";
+            const hasViews = obj.views != null && String(obj.views).trim() !== "";
+            if (!hasThumb || !hasViews) NEEDS_UPDATE_SOURCE_URLS.add(key);
+          }
         }
       } catch {
         // ignore malformed line
@@ -192,14 +215,58 @@ function parseJsonArrayHeader(req, name) {
   return [];
 }
 
+/** Tải ảnh từ URL và lưu vào file. Trả về path tương đối từ ROOT hoặc null nếu lỗi. */
+function downloadThumbnailToFile(thumbnailUrl, destPathAbsolute) {
+  return new Promise((resolve) => {
+    if (!thumbnailUrl || typeof thumbnailUrl !== "string") {
+      resolve(null);
+      return;
+    }
+    const protocol = thumbnailUrl.startsWith("https") ? https : http;
+    const req = protocol.get(thumbnailUrl, { timeout: 15000 }, (res) => {
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        const loc = res.headers.location;
+        if (loc) {
+          downloadThumbnailToFile(loc, destPathAbsolute).then(resolve);
+          return;
+        }
+      }
+      if (res.statusCode !== 200) {
+        resolve(null);
+        return;
+      }
+      const dir = path.dirname(destPathAbsolute);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const file = fs.createWriteStream(destPathAbsolute);
+      res.pipe(file);
+      file.on("finish", () => {
+        file.close();
+        resolve(destPathAbsolute);
+      });
+      file.on("error", () => {
+        try {
+          fs.unlinkSync(destPathAbsolute);
+        } catch {}
+        resolve(null);
+      });
+    });
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(null);
+    });
+  });
+}
+
 function appendMetadata(record) {
   try {
-    if (record.sourceUrl && SEEN_SOURCE_URLS.has(record.sourceUrl)) {
+    const key = record.sourceUrl ? normalizeSourceUrl(record.sourceUrl) : "";
+    if (key && SEEN_SOURCE_URLS.has(key)) {
       return;
     }
     const line = JSON.stringify(record);
     fs.appendFileSync(META_FILE, line + "\n", "utf8");
-    if (record.sourceUrl) SEEN_SOURCE_URLS.add(record.sourceUrl);
+    if (key) SEEN_SOURCE_URLS.add(key);
   } catch (e) {
     console.warn("[meta] append failed:", e.message || e);
   }
@@ -210,7 +277,7 @@ const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "X-Session-Id, X-Index, X-Total, X-Filename, X-Source-Url, X-Page-Title, X-Actors, X-Tags, Content-Type",
+    "X-Session-Id, X-Index, X-Total, X-Filename, X-Source-Url, X-Page-Title, X-Actors, X-Tags, X-Thumbnail-Url, X-Views, Content-Type",
   );
 
   if (req.method === "OPTIONS") {
@@ -231,14 +298,77 @@ const server = http.createServer((req, res) => {
         const urls = Array.isArray(data?.urls)
           ? data.urls.map((u) => String(u)).filter(Boolean)
           : [];
-        const filtered = urls.filter((u) => !SEEN_SOURCE_URLS.has(u));
+        const filtered = urls.filter((u) => !SEEN_SOURCE_URLS.has(normalizeSourceUrl(u)));
+        const updateUrls = urls.filter((u) => NEEDS_UPDATE_SOURCE_URLS.has(normalizeSourceUrl(u)));
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ urls: filtered }));
+        res.end(JSON.stringify({ urls: filtered, updateUrls }));
       } catch (e) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({ error: (e && e.message) || "Bad request" }),
         );
+      }
+    });
+    return;
+  }
+
+  if (req.method === "POST" && urlPath === "/update-metadata") {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", async () => {
+      try {
+        const body = Buffer.concat(chunks).toString("utf8");
+        const data = JSON.parse(body);
+        const sourceUrl = data && typeof data.sourceUrl === "string" ? data.sourceUrl.trim() : "";
+        const thumbnailUrl = data && typeof data.thumbnailUrl === "string" ? data.thumbnailUrl.trim() : "";
+        const views = data && (data.views != null) ? String(data.views).trim() : "";
+        if (!sourceUrl) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Missing sourceUrl" }));
+          return;
+        }
+        if (!fs.existsSync(META_FILE)) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+        const content = fs.readFileSync(META_FILE, "utf8");
+        const lines = content.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+        let found = false;
+        const out = [];
+        for (const line of lines) {
+          let obj;
+          try {
+            obj = JSON.parse(line);
+          } catch {
+            out.push(line);
+            continue;
+          }
+          const norm = normalizeSourceUrl(obj.sourceUrl);
+          if (norm !== normalizeSourceUrl(sourceUrl)) {
+            out.push(line);
+            continue;
+          }
+          found = true;
+          if (thumbnailUrl) {
+            const id = obj.id || crypto.createHash("sha1").update(sourceUrl).digest("hex").slice(0, 16);
+            const thumbPath = path.join(THUMBNAILS_DIR, id + ".jpg");
+            const downloaded = await downloadThumbnailToFile(thumbnailUrl, thumbPath);
+            if (downloaded) obj.thumbnailPath = path.relative(ROOT, downloaded);
+          }
+          if (views !== "") obj.views = views;
+          out.push(JSON.stringify(obj));
+          if (norm) NEEDS_UPDATE_SOURCE_URLS.delete(norm);
+        }
+        if (found) {
+          fs.writeFileSync(META_FILE, out.join("\n") + (out.length ? "\n" : ""), "utf8");
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, updated: found }));
+      } catch (e) {
+        console.warn("[update-metadata]", e.message || e);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: (e && e.message) || "Update failed" }));
       }
     });
     return;
@@ -351,6 +481,19 @@ const server = http.createServer((req, res) => {
           .update(String(idSource))
           .digest("hex")
           .slice(0, 16);
+        const thumbnailUrl = String(req.headers["x-thumbnail-url"] || "").trim();
+        const viewsRaw = String(req.headers["x-views"] || "").trim();
+        const views = viewsRaw ? viewsRaw : undefined;
+        let thumbnailPathRel;
+        if (thumbnailUrl) {
+          const thumbPath = path.join(THUMBNAILS_DIR, id + ".jpg");
+          const downloaded = await downloadThumbnailToFile(
+            thumbnailUrl,
+            thumbPath,
+          );
+          if (downloaded)
+            thumbnailPathRel = path.relative(ROOT, downloaded);
+        }
         appendMetadata({
           id,
           title: pageTitle || "",
@@ -359,6 +502,8 @@ const server = http.createServer((req, res) => {
           sourceUrl,
           actors,
           tags,
+          ...(thumbnailPathRel ? { thumbnailPath: thumbnailPathRel } : {}),
+          ...(views !== undefined ? { views } : {}),
         });
 
         // Xóa folder segments (không giữ lại)
@@ -431,12 +576,25 @@ const server = http.createServer((req, res) => {
         const pageTitle = String(req.headers["x-page-title"] || "");
         const actors = parseJsonArrayHeader(req, "x-actors");
         const tags = parseJsonArrayHeader(req, "x-tags");
+        const thumbnailUrl = String(req.headers["x-thumbnail-url"] || "").trim();
+        const viewsRaw = String(req.headers["x-views"] || "").trim();
+        const views = viewsRaw ? viewsRaw : undefined;
         const idSource = sourceUrl || mp4Name;
         const id = crypto
           .createHash("sha1")
           .update(String(idSource))
           .digest("hex")
           .slice(0, 16);
+        let thumbnailPathRel;
+        if (thumbnailUrl) {
+          const thumbPath = path.join(THUMBNAILS_DIR, id + ".jpg");
+          const downloaded = await downloadThumbnailToFile(
+            thumbnailUrl,
+            thumbPath,
+          );
+          if (downloaded)
+            thumbnailPathRel = path.relative(ROOT, downloaded);
+        }
         appendMetadata({
           id,
           title: pageTitle || "",
@@ -445,6 +603,8 @@ const server = http.createServer((req, res) => {
           sourceUrl,
           actors,
           tags,
+          ...(thumbnailPathRel ? { thumbnailPath: thumbnailPathRel } : {}),
+          ...(views !== undefined ? { views } : {}),
         });
 
         res.writeHead(200, { "Content-Type": "application/json" });

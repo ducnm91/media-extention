@@ -1,12 +1,25 @@
 <script lang="ts" setup>
-import { onMounted, ref } from 'vue';
+import { onMounted, onUnmounted, ref } from 'vue';
 
 const maxTabs = ref<number | null>(null);
 const segmentConcurrency = ref<number | null>(null);
 const autoTriggerDelaySec = ref<number | null>(null);
+const queueCount = ref<number>(0);
 const loading = ref(true);
 const saving = ref(false);
 const error = ref<string | null>(null);
+let queuePollTimer: ReturnType<typeof setInterval> | null = null;
+
+async function fetchQueueCount() {
+  try {
+    const res = (await browser.runtime.sendMessage({
+      type: 'GET_BATCH_QUEUE_COUNT',
+    })) as { count?: number } | undefined;
+    if (typeof res?.count === 'number') queueCount.value = res.count;
+  } catch {
+    // ignore
+  }
+}
 
 async function loadConfig() {
   try {
@@ -65,6 +78,15 @@ async function saveConfig() {
 
 onMounted(() => {
   loadConfig();
+  fetchQueueCount();
+  queuePollTimer = setInterval(fetchQueueCount, 1500);
+});
+
+onUnmounted(() => {
+  if (queuePollTimer) {
+    clearInterval(queuePollTimer);
+    queuePollTimer = null;
+  }
 });
 </script>
 
@@ -72,6 +94,11 @@ onMounted(() => {
   <div class="popup-root">
     <h1 class="title">HLS Downloader</h1>
     <p class="subtitle">Cấu hình tải song song</p>
+
+    <div class="queue-row">
+      <span class="queue-label">Hàng đợi:</span>
+      <strong class="queue-value">{{ queueCount }} video</strong>
+    </div>
 
     <div v-if="loading" class="section muted">Đang tải cấu hình...</div>
 
@@ -157,6 +184,24 @@ onMounted(() => {
   margin: 0;
   font-size: 12px;
   opacity: 0.8;
+}
+
+.queue-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.queue-label {
+  opacity: 0.9;
+}
+
+.queue-value {
+  font-variant-numeric: tabular-nums;
 }
 
 .section {
