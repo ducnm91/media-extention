@@ -189,6 +189,7 @@ export default defineBackground(() => {
         .sendMessage(tabId, {
           type: "SCAN_CATEGORY_PAGE",
           minViews: autoscanMinViews,
+          maxViews: autoscanMaxViews,
         })
         .then((res: any) => {
           if (!res) return;
@@ -287,25 +288,73 @@ export default defineBackground(() => {
     }
   });
 
+  type StartCategoryAutoscanMessage = {
+    type: "START_CATEGORY_AUTOSCAN";
+    categories?: string[];
+    minViews?: number;
+    maxViews?: number;
+  };
+
+  type ScanCategoriesAtIndexMessage = {
+    type: "SCAN_CATEGORIES_AT_INDEX";
+    tabId?: number;
+  };
+
+  type BatchQueueUrlsMessage = {
+    type: "BATCH_QUEUE_URLS";
+    items?: BatchItem[];
+    urls?: string[];
+  };
+
+  type UpdateMetadataMessage = {
+    type: "UPDATE_METADATA";
+    tabId?: number;
+    sourceUrl?: string;
+    views?: string;
+    duration?: string;
+  };
+
+  type BatchDoneMessage = {
+    type: "BATCH_DONE";
+    tabId?: number;
+  };
+
+  type DownloadHlsMessage = {
+    type: "DOWNLOAD_HLS";
+    url: string;
+    pageTitle?: string;
+    meta?: {
+      sourceUrl?: string;
+      actors?: string[];
+      tags?: string[];
+      pageTitle?: string;
+    };
+  };
+
+  type SimpleMessage =
+    | { type: "GET_LAST_ERROR" }
+    | { type: "GET_BATCH_QUEUE_COUNT" }
+    | { type: "PAUSE_BATCH" }
+    | { type: "RESUME_BATCH" }
+    | { type: "GET_LAST_M3U8" }
+    | { type: "INSPECT_M3U8"; url: string };
+
+  type BackgroundMessage =
+    | SimpleMessage
+    | StartCategoryAutoscanMessage
+    | ScanCategoriesAtIndexMessage
+    | BatchQueueUrlsMessage
+    | UpdateMetadataMessage
+    | BatchDoneMessage
+    | DownloadHlsMessage;
+
   browser.runtime.onMessage.addListener(
     (
-      message: {
-        type: string;
-        url?: string;
-        pageTitle?: string;
-        tabId?: number;
-        sourceUrl?: string;
-        views?: string;
-        meta?: {
-          sourceUrl?: string;
-          actors?: string[];
-          tags?: string[];
-          pageTitle?: string;
-        };
-      },
+      rawMessage: BackgroundMessage,
       sender: { tab?: { id?: number } },
       sendResponse,
     ) => {
+      const message = rawMessage as BackgroundMessage;
       if (message.type === "GET_LAST_ERROR") {
         sendResponse(lastError ?? "");
         return true;
@@ -333,9 +382,13 @@ export default defineBackground(() => {
           ? (message.categories as string[])
           : [];
         autoscanMinViews =
-          typeof message.minViews === "number"
-            ? message.minViews
+          typeof (message as { minViews?: number }).minViews === "number"
+            ? (message as { minViews?: number }).minViews!
             : 1_000_000;
+        autoscanMaxViews =
+          typeof (message as { maxViews?: number }).maxViews === "number"
+            ? (message as { maxViews?: number }).maxViews!
+            : 10_000_000_000;
         categoryQueue = list.filter((u) => typeof u === "string" && u.length);
         currentCategoryUrl = categoryQueue.shift() ?? null;
         currentCategoryPageUrl = currentCategoryUrl;
@@ -445,7 +498,7 @@ export default defineBackground(() => {
             try {
               await browser.notifications.create({
                 type: "basic",
-                iconUrl: browser.runtime.getURL("wxt.svg"),
+                iconUrl: browser.runtime.getURL("/popup.html?wxt-icon"),
                 title: "HLS Downloader",
                 message:
                   "Không có video mới để tải (đã có trong metadata).",
@@ -939,6 +992,7 @@ let categoryQueue: string[] = [];
 let currentCategoryUrl: string | null = null;
 let currentCategoryPageUrl: string | null = null;
 let autoscanMinViews = 1_000_000;
+let autoscanMaxViews = 10_000_000_000;
 let categoryScanTabId: number | null = null;
 let isBatchPaused = false;
 
@@ -1014,7 +1068,7 @@ async function notifyAllDownloadsDone() {
     try {
       await browser.notifications.create({
         type: "basic",
-        iconUrl: browser.runtime.getURL("wxt.svg"),
+        iconUrl: browser.runtime.getURL("/popup.html?wxt-icon"),
         title: "HLS Downloader",
         message: "Đã tải xong tất cả video đang xử lý.",
       });
