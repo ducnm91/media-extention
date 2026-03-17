@@ -97,7 +97,8 @@ try {
             SEEN_SOURCE_URLS.add(key);
             const hasThumb = obj.thumbnailPath != null && String(obj.thumbnailPath).trim() !== "";
             const hasViews = obj.views != null && String(obj.views).trim() !== "";
-            if (!hasThumb || !hasViews) NEEDS_UPDATE_SOURCE_URLS.add(key);
+            const hasDuration = obj.duration != null && String(obj.duration).trim() !== "";
+            if (!hasThumb || !hasViews || !hasDuration) NEEDS_UPDATE_SOURCE_URLS.add(key);
           }
         }
       } catch {
@@ -277,7 +278,7 @@ const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "X-Session-Id, X-Index, X-Total, X-Filename, X-Source-Url, X-Page-Title, X-Actors, X-Tags, X-Thumbnail-Url, X-Views, Content-Type",
+    "X-Session-Id, X-Index, X-Total, X-Filename, X-Source-Url, X-Page-Title, X-Actors, X-Tags, X-Thumbnail-Url, X-Views, X-Duration, Content-Type",
   );
 
   if (req.method === "OPTIONS") {
@@ -322,6 +323,7 @@ const server = http.createServer((req, res) => {
         const sourceUrl = data && typeof data.sourceUrl === "string" ? data.sourceUrl.trim() : "";
         const thumbnailUrl = data && typeof data.thumbnailUrl === "string" ? data.thumbnailUrl.trim() : "";
         const views = data && (data.views != null) ? String(data.views).trim() : "";
+        const duration = data && (data.duration != null) ? String(data.duration).trim() : "";
         if (!sourceUrl) {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Missing sourceUrl" }));
@@ -357,8 +359,18 @@ const server = http.createServer((req, res) => {
             if (downloaded) obj.thumbnailPath = path.relative(ROOT, downloaded);
           }
           if (views !== "") obj.views = views;
+          if (duration !== "") obj.duration = duration;
           out.push(JSON.stringify(obj));
-          if (norm) NEEDS_UPDATE_SOURCE_URLS.delete(norm);
+          if (norm) {
+            const hasThumb = obj.thumbnailPath != null && String(obj.thumbnailPath).trim() !== "";
+            const hasViews = obj.views != null && String(obj.views).trim() !== "";
+            const hasDuration = obj.duration != null && String(obj.duration).trim() !== "";
+            if (hasThumb && hasViews && hasDuration) {
+              NEEDS_UPDATE_SOURCE_URLS.delete(norm);
+            } else {
+              NEEDS_UPDATE_SOURCE_URLS.add(norm);
+            }
+          }
         }
         if (found) {
           fs.writeFileSync(META_FILE, out.join("\n") + (out.length ? "\n" : ""), "utf8");
@@ -484,6 +496,8 @@ const server = http.createServer((req, res) => {
         const thumbnailUrl = String(req.headers["x-thumbnail-url"] || "").trim();
         const viewsRaw = String(req.headers["x-views"] || "").trim();
         const views = viewsRaw ? viewsRaw : undefined;
+        const durationRaw = String(req.headers["x-duration"] || "").trim();
+        const duration = durationRaw || undefined;
         let thumbnailPathRel;
         if (thumbnailUrl) {
           const thumbPath = path.join(THUMBNAILS_DIR, id + ".jpg");
@@ -504,6 +518,7 @@ const server = http.createServer((req, res) => {
           tags,
           ...(thumbnailPathRel ? { thumbnailPath: thumbnailPathRel } : {}),
           ...(views !== undefined ? { views } : {}),
+          ...(duration !== undefined ? { duration } : {}),
         });
 
         // Xóa folder segments (không giữ lại)
@@ -579,6 +594,8 @@ const server = http.createServer((req, res) => {
         const thumbnailUrl = String(req.headers["x-thumbnail-url"] || "").trim();
         const viewsRaw = String(req.headers["x-views"] || "").trim();
         const views = viewsRaw ? viewsRaw : undefined;
+        const durationRaw = String(req.headers["x-duration"] || "").trim();
+        const duration = durationRaw || undefined;
         const idSource = sourceUrl || mp4Name;
         const id = crypto
           .createHash("sha1")
@@ -605,6 +622,7 @@ const server = http.createServer((req, res) => {
           tags,
           ...(thumbnailPathRel ? { thumbnailPath: thumbnailPathRel } : {}),
           ...(views !== undefined ? { views } : {}),
+          ...(duration !== undefined ? { duration } : {}),
         });
 
         res.writeHead(200, { "Content-Type": "application/json" });

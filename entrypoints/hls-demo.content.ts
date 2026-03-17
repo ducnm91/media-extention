@@ -177,6 +177,7 @@ function setupDownloadReadyListener() {
             type: "UPDATE_METADATA",
             sourceUrl: meta.sourceUrl,
             views: meta.views,
+            duration: meta.duration,
             tabId,
           });
         } catch {
@@ -185,6 +186,181 @@ function setupDownloadReadyListener() {
       }
     },
   );
+}
+
+browser.runtime.onMessage.addListener(
+  (
+    msg:
+      | { type: "SCAN_CATEGORIES_AT_INDEX" }
+      | { type: "SCAN_CATEGORY_PAGE"; minViews?: number; maxViews?: number },
+    _sender,
+    sendResponse,
+  ) => {
+    if (msg.type === "SCAN_CATEGORIES_AT_INDEX") {
+      const cats = scanXvideosCategories();
+      sendResponse({ categories: cats });
+      return true;
+    }
+    if (msg.type === "SCAN_CATEGORY_PAGE") {
+      const mv =
+        typeof msg.minViews === "number" ? msg.minViews : 1_000_000;
+      const maxv =
+        typeof msg.maxViews === "number" ? msg.maxViews : 10_000_000_000;
+      const res = scanXvideosCategoryListPage(mv, maxv);
+      sendResponse(res);
+      return true;
+    }
+    return false;
+  },
+);
+
+function scanXvideosCategories(): { url: string; label: string }[] {
+  const base = `${window.location.protocol}//${window.location.host}`;
+  // Lấy TẤT CẢ <li> trong #main-cats-sub-list (dyn, dyntopterm, dyntop-cat, ...)
+  const anchors = document.querySelectorAll<HTMLAnchorElement>(
+    "#main-cats-sub-list li > a",
+  );
+  const res: { url: string; label: string }[] = [];
+  for (const a of anchors) {
+    const href = (a.getAttribute("href") || "").trim();
+    if (!href) continue;
+    const full = href.startsWith("http") ? href : new URL(href, base).href;
+    const label = (a.textContent || "").trim();
+    if (!label) continue;
+    // Bỏ mục "All tags" nếu có
+    if (label.toLowerCase().includes("all tags")) continue;
+    res.push({ url: full, label });
+  }
+  return res;
+}
+
+function parseViews(text: string): number {
+  // Ví dụ text: "12 min 1pondo - 38.3M Views -"
+  const withoutViews = text.replace(/Views?/gi, "").replace(/[-–—]/g, " ");
+  const tokens = withoutViews.split(/\s+/).filter((t) => t.length > 0);
+  for (let i = tokens.length - 1; i >= 0; i--) {
+    const tok = tokens[i];
+    const m = tok.match(/^([\d.,]+)\s*([kKmMbB])?$/);
+    if (!m) continue;
+    const num = parseFloat(m[1].replace(/,/g, ""));
+    if (!isFinite(num)) continue;
+    const unit = (m[2] || "").toLowerCase();
+    if (unit === "k") return num * 1e3;
+    if (unit === "m") return num * 1e6;
+    if (unit === "b") return num * 1e9;
+    return num;
+  }
+  return 0;
+}
+
+function parseDurationToMinutes(text: string): number {
+  const t = text.trim().toLowerCase();
+  if (!t) return 0;
+  const m1 = t.match(/^(\d+)\s*min/);
+  if (m1) return parseInt(m1[1], 10) || 0;
+  const parts = t.split(":").map((p) => p.trim());
+  if (parts.length === 2) {
+    const mm = parseInt(parts[0], 10) || 0;
+    const ss = parseInt(parts[1], 10) || 0;
+    return mm + ss / 60;
+  }
+  if (parts.length === 3) {
+    const hh = parseInt(parts[0], 10) || 0;
+    const mm = parseInt(parts[1], 10) || 0;
+    const ss = parseInt(parts[2], 10) || 0;
+    return hh * 60 + mm + ss / 60;
+  }
+  const n = parseInt(t, 10);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function scanXvideosCategoryListPage(
+  minViews: number,
+  maxViews: number,
+): {
+  videos: { url: string; thumbnailUrl: string; views: number; durationMinutes: number }[];
+  hasHighVideos: boolean;
+  nextPageUrl: string | null;
+  redirected?: boolean;
+} {
+  const base = `${window.location.protocol}//${window.location.host}`;
+  const sortViewsLink = document.querySelector<HTMLAnchorElement>(
+    '.niv2.search-filters .uls ul li a[href^="/c/s:views"]',
+  );
+  const hrefNow = window.location.href;
+  const isSortedByViews =
+    (sortViewsLink && sortViewsLink.classList.contains("current")) ||
+    hrefNow.includes("/c/s:views") ||
+    hrefNow.includes("views") ||
+    hrefNow.includes("sort=views");
+  if (!isSortedByViews && sortViewsLink?.href) {
+    // Giả lập click tay vào nút sort theo views để site xử lý đúng logic
+    sortViewsLink.click();
+    return { videos: [], hasHighVideos: false, nextPageUrl: null, redirected: true };
+  }
+
+  const items = document.querySelectorAll<HTMLDivElement>(
+    "div.frame-block.thumb-block",
+  );
+  const videos: {
+    url: string;
+    thumbnailUrl: string;
+    views: number;
+    durationMinutes: number;
+  }[] = [];
+
+  for (const item of items) {
+    const aVideo = item.querySelector<HTMLAnchorElement>(
+      '.thumb a[href*="/video."]',
+    );
+    if (!aVideo) continue;
+    const href = (aVideo.getAttribute("href") || "").trim();
+    if (!href) continue;
+    const url = href.startsWith("http") ? href : new URL(href, base).href;
+
+    const img = aVideo.querySelector<HTMLImageElement>("img");
+    const thumbnailUrl = img?.src || "";
+
+    const metadataP =
+      item.querySelector<HTMLElement>(".thumb-under p.metadata");
+    const viewsText = metadataP?.textContent || "";
+    const views = parseViews(viewsText);
+
+    const durationSpan = item.querySelector<HTMLElement>(
+      ".thumb-under p.title span.duration",
+    );
+    const durationText = durationSpan?.textContent || "";
+    const durationMinutes = parseDurationToMinutes(durationText);
+
+    if (
+      views >= minViews &&
+      views < maxViews &&
+      durationMinutes <= 30
+    ) {
+      videos.push({ url, thumbnailUrl, views, durationMinutes });
+    }
+  }
+
+  const hasHighVideos = videos.length > 0;
+
+  let nextPageUrl: string | null = null;
+  const nextLink =
+    document.querySelector<HTMLAnchorElement>(
+      ".pagination ul li a.no-page.next-page",
+    ) ||
+    document.querySelector<HTMLAnchorElement>(
+      ".pagination ul li a:not(.active)",
+    );
+  if (nextLink) {
+    const nhref = (nextLink.getAttribute("href") || "").trim();
+    if (nhref) {
+      nextPageUrl = nhref.startsWith("http")
+        ? nhref
+        : new URL(nhref, base).href;
+    }
+  }
+
+  return { videos, hasHighVideos, nextPageUrl };
 }
 
 function findStreamUrl(): string | null {
@@ -334,6 +510,7 @@ function collectPageMetadata(): {
   actors: string[];
   tags: string[];
   views?: string;
+  duration?: string;
 } {
   const sourceUrl = window.location.href;
   const hostname = window.location.hostname || "";
@@ -341,6 +518,7 @@ function collectPageMetadata(): {
   let actors: string[] = [];
   let tags: string[] = [];
   let views: string | undefined;
+  let duration: string | undefined;
 
   if (hostname.includes("xvideos.com")) {
     actors = Array.from(
@@ -362,9 +540,20 @@ function collectPageMetadata(): {
       const raw = (viewsEl.textContent || "").trim().replace(/,/g, "");
       if (raw) views = raw;
     }
+    // Trang detail: <span class="duration">8 min</span> — ưu tiên trong #main trước
+    const main = document.querySelector("#main, main");
+    const scope = main || document;
+    const durationSpans = scope.querySelectorAll<HTMLElement>("span.duration");
+    for (const el of durationSpans) {
+      const raw = (el.textContent || "").trim();
+      if (raw) {
+        duration = raw;
+        break;
+      }
+    }
   }
 
-  return { sourceUrl, actors, tags, views };
+  return { sourceUrl, actors, tags, views, duration };
 }
 
 /** Item: url trang video + thumbnail từ img trong thẻ a (để server tải ảnh và lưu path). */

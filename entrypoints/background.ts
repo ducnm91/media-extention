@@ -178,6 +178,112 @@ export default defineBackground(() => {
             }
           });
       }, 3000);
+      return;
+    }
+    if (
+      categoryScanTabId != null &&
+      tabId === categoryScanTabId &&
+      currentCategoryPageUrl
+    ) {
+      browser.tabs
+        .sendMessage(tabId, {
+          type: "SCAN_CATEGORY_PAGE",
+          minViews: autoscanMinViews,
+        })
+        .then((res: any) => {
+          if (!res) return;
+          if (res.redirected === true) {
+            return;
+          }
+          const videos = Array.isArray(res.videos) ? res.videos : [];
+          const hasHighVideos = !!res.hasHighVideos;
+          const nextPageUrl =
+            typeof res.nextPageUrl === "string" && res.nextPageUrl
+              ? (res.nextPageUrl as string)
+              : null;
+
+          if (videos.length) {
+            const items: BatchItem[] = videos.map((v: any) => ({
+              url: String(v.url),
+              thumbnailUrl: v.thumbnailUrl ? String(v.thumbnailUrl) : undefined,
+            }));
+            const urls = items.map((i) => i.url);
+
+            // Dùng cùng cơ chế filter/update như BATCH_QUEUE_URLS:
+            // - Không download lại video đã có trong metadata (filteredUrls)
+            // - Với URL đã có nhưng thiếu thumbnail/views/duration → đưa vào updateQueue
+            (async () => {
+              let filteredUrls = urls;
+              try {
+                const res = await fetch(`${SERVER_BASE}/filter-source-urls`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ urls }),
+                });
+                if (res.ok) {
+                  const data = (await res.json()) as {
+                    urls?: string[];
+                    updateUrls?: string[];
+                  };
+                  filteredUrls = Array.isArray(data.urls) ? data.urls : urls;
+                  const updateUrls = Array.isArray(data.updateUrls)
+                    ? data.updateUrls
+                    : [];
+                  const existingUpdateUrls = new Set(
+                    updateQueue.map((i) => i.url),
+                  );
+                  for (const url of updateUrls) {
+                    if (!existingUpdateUrls.has(url)) {
+                      updateQueue.push({
+                        url,
+                        thumbnailUrl: items.find((i) => i.url === url)
+                          ?.thumbnailUrl,
+                      });
+                      existingUpdateUrls.add(url);
+                    }
+                  }
+                  void processUpdateQueue();
+                }
+              } catch (e) {
+                console.warn(
+                  "[autoscan] Filter request failed, using all URLs",
+                  e && (e as Error).message,
+                );
+              }
+
+              const toQueue: BatchItem[] = filteredUrls.map((url) => ({
+                url,
+                thumbnailUrl: items.find((i) => i.url === url)?.thumbnailUrl,
+              }));
+              const existingUrls = new Set(batchQueue.map((i) => i.url));
+              for (const item of toQueue) {
+                if (!existingUrls.has(item.url)) {
+                  batchQueue.push(item);
+                  existingUrls.add(item.url);
+                }
+              }
+              void processBatchQueue();
+            })();
+          }
+
+          if (hasHighVideos && nextPageUrl) {
+            currentCategoryPageUrl = nextPageUrl;
+            setTimeout(() => {
+              void openOrReuseCategoryScanTab(nextPageUrl);
+            }, 3000);
+          } else {
+            currentCategoryUrl = categoryQueue.shift() ?? null;
+            currentCategoryPageUrl = currentCategoryUrl;
+            if (currentCategoryPageUrl) {
+              void openOrReuseCategoryScanTab(currentCategoryPageUrl);
+            } else {
+              categoryScanTabId = null;
+            }
+          }
+        })
+        .catch(() => {
+          // ignore scan error
+        });
     }
   });
 
@@ -206,6 +312,49 @@ export default defineBackground(() => {
       }
       if (message.type === "GET_BATCH_QUEUE_COUNT") {
         sendResponse({ count: batchQueue.length });
+        return false;
+      }
+      if (message.type === "SCAN_CATEGORIES_AT_INDEX") {
+        const tabId = message.tabId ?? sender.tab?.id;
+        if (!tabId) {
+          sendResponse({ categories: [] });
+          return false;
+        }
+        browser.tabs
+          .sendMessage(tabId, { type: "SCAN_CATEGORIES_AT_INDEX" })
+          .then((res) => {
+            sendResponse(res ?? { categories: [] });
+          })
+          .catch(() => sendResponse({ categories: [] }));
+        return true;
+      }
+      if (message.type === "START_CATEGORY_AUTOSCAN") {
+        const list = Array.isArray(message.categories)
+          ? (message.categories as string[])
+          : [];
+        autoscanMinViews =
+          typeof message.minViews === "number"
+            ? message.minViews
+            : 1_000_000;
+        categoryQueue = list.filter((u) => typeof u === "string" && u.length);
+        currentCategoryUrl = categoryQueue.shift() ?? null;
+        currentCategoryPageUrl = currentCategoryUrl;
+        if (currentCategoryPageUrl) {
+          void openOrReuseCategoryScanTab(currentCategoryPageUrl);
+        }
+        sendResponse(true);
+        return false;
+      }
+      if (message.type === "PAUSE_BATCH") {
+        isBatchPaused = true;
+        sendResponse(true);
+        return false;
+      }
+      if (message.type === "RESUME_BATCH") {
+        isBatchPaused = false;
+        void processBatchQueue();
+        void processUpdateQueue();
+        sendResponse(true);
         return false;
       }
       if (message.type === "GET_LAST_M3U8" && sender.tab?.id) {
@@ -330,6 +479,11 @@ export default defineBackground(() => {
                 sourceUrl: sourceUrl || "",
                 thumbnailUrl: item?.thumbnailUrl || "",
                 views: views || undefined,
+                duration:
+                  typeof message.duration === "string" &&
+                  message.duration.trim()
+                    ? message.duration.trim()
+                    : undefined,
               }),
             });
           } catch (e) {
@@ -374,112 +528,154 @@ export default defineBackground(() => {
           pageTitle: sanitizedTitle,
         };
 
-        if (titleKey && activeDownloadTitles.has(titleKey)) {
-          lastError =
-            "Video này (theo title trang) đang được tải. Đợi tải xong rồi hãy bấm lại để tránh trùng.";
-          sendResponse(false);
-          return false;
-        }
-
-        if (
-          !activeDownloadTabs.has(tabId) &&
-          activeDownloadTabs.size >= CONFIG.maxParallelDownloadTabs
-        ) {
-          lastError = `Đang tải tối đa ${CONFIG.maxParallelDownloadTabs} tab cùng lúc. Đợi một số tab tải xong rồi thử lại.`;
-          sendResponse(false);
-          return false;
-        }
-
-        activeDownloadTabs.add(tabId);
-        if (titleKey) activeDownloadTitles.add(titleKey);
-        updateActionBadge();
-
-        downloadHls(message.url, tabId, message.pageTitle || "")
-          .then(async (result) => {
-            if (!result) {
-              sendResponse(true);
-              return;
-            }
-            const sessionId = result.filename
-              .replace(/\.ts$/i, "")
-              .replace(/\.mp4$/i, "");
-            const extra = batchTabIdToExtraMeta.get(tabId);
-            const metaWithThumb = {
-              ...meta,
-              thumbnailUrl: extra?.thumbnailUrl,
-            };
-            const saved =
-              result.segmentBuffers.length > 0
-                ? await trySaveSegmentsToServer(
-                    result.segmentBuffers,
-                    sessionId,
-                    metaWithThumb,
-                  )
-                : null;
-            if (saved) {
-              try {
-                await browser.tabs.sendMessage(
-                  tabId,
-                  { type: "HLS_SAVE_RESULT", success: true, mp4: saved },
-                  { frameId: 0 },
-                );
-              } catch {
-                // Tab đã đóng hoặc reload
-              }
-              try {
-                await browser.tabs.remove(tabId);
-              } catch {
-                // ignore
-              }
-              sendResponse(true);
-              return;
-            }
-            const fallback = await trySaveToServer(
-              result.buffer,
-              result.filename,
-              metaWithThumb,
-            );
-            if (fallback) {
-              try {
-                await browser.tabs.sendMessage(
-                  tabId,
-                  { type: "HLS_SAVE_RESULT", success: true, mp4: fallback },
-                  { frameId: 0 },
-                );
-              } catch {
-                // Tab đã đóng hoặc reload
-              }
-              try {
-                await browser.tabs.remove(tabId);
-              } catch {
-                // ignore
-              }
-              sendResponse(true);
-              return;
-            }
-            const buffer = result.buffer;
-            return sendChunksToTab(tabId, buffer, result.filename).then(() =>
-              sendResponse(true),
-            );
-          })
-          .catch((err) => {
-            lastError = err instanceof Error ? err.message : String(err);
+        const startDownload = () => {
+          if (titleKey && activeDownloadTitles.has(titleKey)) {
+            lastError =
+              "Video này (theo title trang) đang được tải. Đợi tải xong rồi hãy bấm lại để tránh trùng.";
             sendResponse(false);
-            if (batchTabIds.has(tabId)) {
-              batchTabIds.delete(tabId);
-              batchPendingTrigger.delete(tabId);
+            return;
+          }
+
+          if (
+            !activeDownloadTabs.has(tabId) &&
+            activeDownloadTabs.size >= CONFIG.maxParallelDownloadTabs
+          ) {
+            lastError = `Đang tải tối đa ${CONFIG.maxParallelDownloadTabs} tab cùng lúc. Đợi một số tab tải xong rồi thử lại.`;
+            sendResponse(false);
+            return;
+          }
+
+          activeDownloadTabs.add(tabId);
+          if (titleKey) activeDownloadTitles.add(titleKey);
+          updateActionBadge();
+
+          downloadHls(message.url, tabId, message.pageTitle || "")
+            .then(async (result) => {
+              if (!result) {
+                sendResponse(true);
+                return;
+              }
+              const sessionId = result.filename
+                .replace(/\.ts$/i, "")
+                .replace(/\.mp4$/i, "");
+              const extra = batchTabIdToExtraMeta.get(tabId);
+              const metaWithThumb = {
+                ...meta,
+                thumbnailUrl: extra?.thumbnailUrl,
+              };
+              const saved =
+                result.segmentBuffers.length > 0
+                  ? await trySaveSegmentsToServer(
+                      result.segmentBuffers,
+                      sessionId,
+                      metaWithThumb,
+                    )
+                  : null;
+              if (saved) {
+                try {
+                  await browser.tabs.sendMessage(
+                    tabId,
+                    { type: "HLS_SAVE_RESULT", success: true, mp4: saved },
+                    { frameId: 0 },
+                  );
+                } catch {
+                  // Tab đã đóng hoặc reload
+                }
+                try {
+                  await browser.tabs.remove(tabId);
+                } catch {
+                  // ignore
+                }
+                sendResponse(true);
+                return;
+              }
+              const fallback = await trySaveToServer(
+                result.buffer,
+                result.filename,
+                metaWithThumb,
+              );
+              if (fallback) {
+                try {
+                  await browser.tabs.sendMessage(
+                    tabId,
+                    { type: "HLS_SAVE_RESULT", success: true, mp4: fallback },
+                    { frameId: 0 },
+                  );
+                } catch {
+                  // Tab đã đóng hoặc reload
+                }
+                try {
+                  await browser.tabs.remove(tabId);
+                } catch {
+                  // ignore
+                }
+                sendResponse(true);
+                return;
+              }
+              const buffer = result.buffer;
+              return sendChunksToTab(tabId, buffer, result.filename).then(() =>
+                sendResponse(true),
+              );
+            })
+            .catch((err) => {
+              lastError = err instanceof Error ? err.message : String(err);
+              sendResponse(false);
+              if (batchTabIds.has(tabId)) {
+                batchTabIds.delete(tabId);
+                batchPendingTrigger.delete(tabId);
+                batchTabIdToExtraMeta.delete(tabId);
+                browser.tabs.remove(tabId).catch(() => {});
+                void processBatchQueue();
+              }
+            })
+            .finally(() => {
+              activeDownloadTabs.delete(tabId);
+              if (titleKey) activeDownloadTitles.delete(titleKey);
               batchTabIdToExtraMeta.delete(tabId);
-              browser.tabs.remove(tabId).catch(() => {});
-              void processBatchQueue();
-            }
+              updateActionBadge();
+              void notifyAllDownloadsDone();
+            });
+        };
+
+        if (meta.sourceUrl) {
+          fetch(`${SERVER_BASE}/filter-source-urls`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ urls: [meta.sourceUrl] }),
           })
-          .finally(() => {
-            activeDownloadTabs.delete(tabId);
-            if (titleKey) activeDownloadTitles.delete(titleKey);
-            batchTabIdToExtraMeta.delete(tabId);
-            updateActionBadge();
-            void notifyAllDownloadsDone();
-          });
+            .then((resp) => {
+              if (!resp.ok) return null;
+              return resp
+                .json()
+                .then(
+                  (data) =>
+                    (data as { urls?: string[]; updateUrls?: string[] }) || null,
+                )
+                .catch(() => null);
+            })
+            .then((data) => {
+              if (!data) {
+                startDownload();
+                return;
+              }
+              const urls = Array.isArray(data.urls) ? data.urls : [];
+              if (urls.length === 0) {
+                lastError =
+                  "Video này đã có trong metadata (theo sourceUrl). Bỏ qua để tránh tải trùng.";
+                sendResponse(false);
+                return;
+              }
+              startDownload();
+            })
+            .catch(() => {
+              // nếu server lỗi thì bỏ qua check trùng, tiếp tục tải như bình thường
+              startDownload();
+            });
+          return true; // giữ kênh mở cho sendResponse async
+        }
+
+        // Không có sourceUrl → không kiểm tra trùng, tải như bình thường
+        startDownload();
         return true; // keep channel open for async sendResponse
       }
       return false;
@@ -739,7 +935,15 @@ const updateTabIds = new Set<number>();
 const updatePendingTrigger = new Set<number>();
 const updateTabIdToItem = new Map<number, BatchItem>();
 
+let categoryQueue: string[] = [];
+let currentCategoryUrl: string | null = null;
+let currentCategoryPageUrl: string | null = null;
+let autoscanMinViews = 1_000_000;
+let categoryScanTabId: number | null = null;
+let isBatchPaused = false;
+
 async function processBatchQueue() {
+  if (isBatchPaused) return;
   while (
     batchQueue.length > 0 &&
     batchTabIds.size < CONFIG.maxParallelDownloadTabs
@@ -763,6 +967,7 @@ async function processBatchQueue() {
 }
 
 async function processUpdateQueue() {
+  if (isBatchPaused) return;
   if (updateQueue.length === 0 || updateTabIds.size >= CONFIG.maxParallelDownloadTabs)
     return;
   const item = updateQueue.shift();
@@ -779,6 +984,19 @@ async function processUpdateQueue() {
     console.warn("[update] Failed to create tab:", e);
     void processUpdateQueue();
   }
+}
+
+async function openOrReuseCategoryScanTab(url: string) {
+  if (categoryScanTabId != null) {
+    try {
+      await browser.tabs.update(categoryScanTabId, { url, active: false });
+      return;
+    } catch {
+      categoryScanTabId = null;
+    }
+  }
+  const tab = await browser.tabs.create({ url, active: false });
+  categoryScanTabId = tab.id ?? null;
 }
 
 function updateActionBadge() {
@@ -854,6 +1072,7 @@ async function trySaveSegmentsToServer(
     pageTitle?: string;
     views?: string;
     thumbnailUrl?: string;
+    duration?: string;
   },
 ): Promise<string | null> {
   try {
@@ -896,6 +1115,9 @@ async function trySaveSegmentsToServer(
         ...(meta.thumbnailUrl
           ? { "X-Thumbnail-Url": meta.thumbnailUrl }
           : {}),
+        ...(meta.duration !== undefined && meta.duration !== ""
+          ? { "X-Duration": String(meta.duration) }
+          : {}),
       },
     });
     const data = (await finishRes.json().catch(() => ({}))) as {
@@ -920,6 +1142,7 @@ async function trySaveToServer(
     pageTitle?: string;
     views?: string;
     thumbnailUrl?: string;
+    duration?: string;
   },
 ): Promise<string | null> {
   try {
@@ -937,6 +1160,9 @@ async function trySaveToServer(
           : {}),
         ...(meta.thumbnailUrl
           ? { "X-Thumbnail-Url": meta.thumbnailUrl }
+          : {}),
+        ...(meta.duration !== undefined && meta.duration !== ""
+          ? { "X-Duration": String(meta.duration) }
           : {}),
       },
     });

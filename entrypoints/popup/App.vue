@@ -1,13 +1,22 @@
 <script lang="ts" setup>
-import { onMounted, onUnmounted, ref } from 'vue';
+import { onMounted, onUnmounted, ref, watch } from 'vue';
 
 const maxTabs = ref<number | null>(null);
 const segmentConcurrency = ref<number | null>(null);
 const autoTriggerDelaySec = ref<number | null>(null);
+const minViews = ref<number | null>(1000000);
+const maxViews = ref<number | null>(10_000_000_000);
+
+type CategoryItem = { url: string; label: string; selected: boolean };
+const categories = ref<CategoryItem[]>([]);
+
 const queueCount = ref<number>(0);
 const loading = ref(true);
-const saving = ref(false);
 const error = ref<string | null>(null);
+const scanningCategories = ref(false);
+const startingAutoscan = ref(false);
+const batchPaused = ref(false);
+
 let queuePollTimer: ReturnType<typeof setInterval> | null = null;
 
 async function fetchQueueCount() {
@@ -29,11 +38,14 @@ async function loadConfig() {
       'maxParallelDownloadTabs',
       'segmentFetchConcurrency',
       'autoTriggerDelaySec',
+      'minViewsForAutoDownload',
+      'maxViewsForAutoDownload',
+      'autoscanCategories',
     ]);
     maxTabs.value =
       typeof stored.maxParallelDownloadTabs === 'number'
         ? stored.maxParallelDownloadTabs
-        : 4;
+        : 2;
     segmentConcurrency.value =
       typeof stored.segmentFetchConcurrency === 'number'
         ? stored.segmentFetchConcurrency
@@ -42,6 +54,22 @@ async function loadConfig() {
       typeof stored.autoTriggerDelaySec === 'number'
         ? stored.autoTriggerDelaySec
         : 5;
+    minViews.value =
+      typeof stored.minViewsForAutoDownload === 'number'
+        ? stored.minViewsForAutoDownload
+        : 1_000_000;
+    maxViews.value =
+      typeof stored.maxViewsForAutoDownload === 'number'
+        ? stored.maxViewsForAutoDownload
+        : 10_000_000_000;
+    const storedCats = stored.autoscanCategories;
+    if (Array.isArray(storedCats)) {
+      categories.value = storedCats.map((c: any) => ({
+        url: String(c.url || ''),
+        label: String(c.label || ''),
+        selected: !!c.selected,
+      })).filter((c) => c.url && c.label);
+    }
   } catch (e) {
     error.value =
       e instanceof Error ? e.message : 'Không thể tải cấu hình hiện tại.';
@@ -54,25 +82,127 @@ async function saveConfig() {
   if (
     maxTabs.value == null ||
     segmentConcurrency.value == null ||
-    autoTriggerDelaySec.value == null
+    autoTriggerDelaySec.value == null ||
+    minViews.value == null ||
+    maxViews.value == null
   )
     return;
   const mt = Math.max(1, Math.min(20, Math.floor(maxTabs.value)));
   const sc = Math.max(1, Math.min(64, Math.floor(segmentConcurrency.value)));
   const delay = Math.max(1, Math.min(60, Math.floor(autoTriggerDelaySec.value)));
+  const mv = Math.max(1000, Math.min(1_000_000_000, Math.floor(minViews.value)));
+  const maxv = Math.max(
+    mv + 1,
+    Math.min(10_000_000_000, Math.floor(maxViews.value)),
+  );
   try {
-    saving.value = true;
     error.value = null;
     await browser.storage.sync.set({
       maxParallelDownloadTabs: mt,
       segmentFetchConcurrency: sc,
       autoTriggerDelaySec: delay,
+      minViewsForAutoDownload: mv,
+      maxViewsForAutoDownload: maxv,
     });
   } catch (e) {
     error.value =
       e instanceof Error ? e.message : 'Không thể lưu cấu hình. Thử lại.';
+  }
+}
+
+async function scanCategoriesFromCurrentTab() {
+  try {
+    scanningCategories.value = true;
+    error.value = null;
+    const [activeTab] = await browser.tabs.query({
+      active: true,
+      currentWindow: true,
+    });
+    if (!activeTab?.id) {
+      error.value = 'Không tìm thấy tab hiện tại.';
+      return;
+    }
+    const res = (await browser.runtime.sendMessage({
+      type: 'SCAN_CATEGORIES_AT_INDEX',
+      tabId: activeTab.id,
+    })) as
+      | {
+          categories?: { url: string; label: string }[];
+        }
+      | undefined;
+    const list = Array.isArray(res?.categories) ? res!.categories : [];
+    categories.value = list.map((c) => ({
+      ...c,
+      // Mặc định bỏ chọn hết khi vừa quét danh sách chuyên mục
+      selected: false,
+    }));
+    // auto lưu danh sách chuyên mục + trạng thái selected
+    await browser.storage.sync.set({
+      autoscanCategories: categories.value.map((c) => ({
+        url: c.url,
+        label: c.label,
+        selected: c.selected,
+      })),
+    });
+  } catch (e) {
+    error.value =
+      e instanceof Error
+        ? e.message
+        : 'Không thể quét danh sách chuyên mục. Mở đúng trang index rồi thử lại.';
   } finally {
-    saving.value = false;
+    scanningCategories.value = false;
+  }
+}
+
+async function startCategoryAutoscan() {
+  if (!categories.value.length) return;
+  const selected = categories.value.filter((c) => c.selected);
+  if (!selected.length) {
+    error.value = 'Hãy chọn ít nhất một chuyên mục.';
+    return;
+  }
+  const mv = minViews.value ?? 1000000;
+  const maxv = maxViews.value ?? 10_000_000_000;
+  const minViewsClamped = Math.max(
+    1000,
+    Math.min(1_000_000_000, Math.floor(mv)),
+  );
+  const maxViewsClamped = Math.max(
+    minViewsClamped + 1,
+    Math.min(10_000_000_000, Math.floor(maxv)),
+  );
+  try {
+    startingAutoscan.value = true;
+    error.value = null;
+    await browser.runtime.sendMessage({
+      type: 'START_CATEGORY_AUTOSCAN',
+      categories: selected.map((c) => c.url),
+      minViews: minViewsClamped,
+      maxViews: maxViewsClamped,
+    });
+  } catch (e) {
+    error.value =
+      e instanceof Error ? e.message : 'Không thể bắt đầu autoscan chuyên mục.';
+  } finally {
+    startingAutoscan.value = false;
+  }
+}
+
+async function pauseBatch() {
+  try {
+    await browser.runtime.sendMessage({ type: 'PAUSE_BATCH' });
+    batchPaused.value = true;
+  } catch {
+    // ignore
+  }
+}
+
+async function resumeBatch() {
+  try {
+    await browser.runtime.sendMessage({ type: 'RESUME_BATCH' });
+    batchPaused.value = false;
+  } catch {
+    // ignore
   }
 }
 
@@ -80,6 +210,33 @@ onMounted(() => {
   loadConfig();
   fetchQueueCount();
   queuePollTimer = setInterval(fetchQueueCount, 1500);
+
+  // Auto-save cấu hình khi giá trị thay đổi
+  watch(
+    [maxTabs, segmentConcurrency, autoTriggerDelaySec, minViews, maxViews],
+    () => {
+      void saveConfig();
+    },
+  );
+
+  // Auto-save trạng thái selected của chuyên mục
+  watch(
+    categories,
+    async () => {
+      try {
+        await browser.storage.sync.set({
+          autoscanCategories: categories.value.map((c) => ({
+            url: c.url,
+            label: c.label,
+            selected: c.selected,
+          })),
+        });
+      } catch {
+        // ignore
+      }
+    },
+    { deep: true },
+  );
 });
 
 onUnmounted(() => {
@@ -145,19 +302,91 @@ onUnmounted(() => {
         />
       </label>
 
-      <button
-        type="button"
-        class="save-btn"
-        :disabled="
-          saving ||
-          maxTabs == null ||
-          segmentConcurrency == null ||
-          autoTriggerDelaySec == null
-        "
-        @click="saveConfig"
-      >
-        {{ saving ? 'Đang lưu...' : 'Lưu cấu hình' }}
-      </button>
+      <label class="field">
+        <div class="field-label">
+          Min views để auto tải
+          <span class="hint">(ví dụ 1000000)</span>
+        </div>
+        <input
+          v-model.number="minViews"
+          type="number"
+          min="1000"
+          class="input"
+        />
+      </label>
+
+      <label class="field">
+        <div class="field-label">
+          Max views để auto tải
+          <span class="hint">(ví dụ 100000000)</span>
+        </div>
+        <input
+          v-model.number="maxViews"
+          type="number"
+          min="1000"
+          class="input"
+        />
+      </label>
+
+      <div class="section">
+        <div class="field-label">Quét chuyên mục (xvideos)</div>
+        <button
+          type="button"
+          class="save-btn"
+          :disabled="scanningCategories"
+          @click="scanCategoriesFromCurrentTab"
+        >
+          {{
+            scanningCategories
+              ? 'Đang quét chuyên mục...'
+              : 'Lấy danh sách chuyên mục từ trang hiện tại'
+          }}
+        </button>
+
+        <div v-if="categories.length" class="category-list">
+          <label
+            v-for="cat in categories"
+            :key="cat.url"
+            class="category-item"
+          >
+            <input type="checkbox" v-model="cat.selected" />
+            <span class="category-label">{{ cat.label }}</span>
+          </label>
+
+          <button
+            type="button"
+            class="save-btn"
+            :disabled="startingAutoscan"
+            @click="startCategoryAutoscan"
+          >
+            {{
+              startingAutoscan
+                ? 'Đang bắt đầu autoscan...'
+                : 'Bắt đầu scan & download'
+            }}
+          </button>
+        </div>
+
+        <div class="section">
+          <div class="field-label">Điều khiển batch download</div>
+          <button
+            type="button"
+            class="save-btn"
+            :disabled="batchPaused"
+            @click="pauseBatch"
+          >
+            Tạm dừng mở tab mới
+          </button>
+          <button
+            type="button"
+            class="save-btn"
+            :disabled="!batchPaused"
+            @click="resumeBatch"
+          >
+            Tiếp tục
+          </button>
+        </div>
+      </div>
 
       <p v-if="error" class="error">
         {{ error }}
@@ -202,6 +431,31 @@ onUnmounted(() => {
 
 .queue-value {
   font-variant-numeric: tabular-nums;
+}
+
+.category-list {
+  margin-top: 6px;
+  max-height: 180px;
+  overflow: auto;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.category-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.category-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .section {
