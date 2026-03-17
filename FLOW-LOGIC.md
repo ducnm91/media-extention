@@ -125,9 +125,14 @@ Tài liệu kỹ thuật mô tả luồng xử lý, message passing và state tr
 
 ## 5. Flow: Quét và tải hàng loạt (batch)
 
-### 5.1. Quét và lọc
+Có **2 cách** để đưa URL vào batch:
 
-1. User ở **trang danh sách** (vd. category xvideos), bấm **📋 Quét và tải hàng loạt**.
+- **Cách 1 – Content script tự quét list hiện tại** (nút riêng trong content – không dùng min/max views).
+- **Cách 2 – Autoscan chuyên mục xvideos** (chọn category trong popup, cấu hình minViews/maxViews, extension tự scan nhiều trang).
+
+### 5.1. Quét và lọc (từ content script hiện tại)
+
+1. User ở **trang danh sách** (vd. category xvideos), bấm **📋 Quét và tải hàng loạt** (nút được inject bởi content script).
 2. Content script: **collectVideoPageLinks()** → `[{ url, thumbnailUrl }, ...]` (url = origin+pathname, thumbnailUrl từ `img.src` trong `<a>`).
 3. Gửi **BATCH_QUEUE_URLS** với `items`.
 4. Background:
@@ -141,7 +146,56 @@ Tài liệu kỹ thuật mô tả luồng xử lý, message passing và state tr
    - Gọi **processBatchQueue()**.
    - Reply cho content: ok, total, queued, skipped, totalInQueue.
 
-### 5.2. Mở tab và trigger tải (batch download)
+### 5.2. Autoscan chuyên mục xvideos (minViews/maxViews)
+
+Flow này dùng kết hợp **popup + background + content script hls-demo** để tự động:
+
+- Lấy danh sách chuyên mục xvideos từ trang index.
+- Chọn chuyên mục trong popup.
+- Cấu hình **khoảng views**: `views >= minViews && views < maxViews` và `durationMinutes <= 30`.
+- Mở từng trang category, quét, lọc, rồi **đẩy vào batchQueue/updateQueue** giống như BATCH_QUEUE_URLS.
+
+Chi tiết:
+
+1. Trong popup:
+   - `scanCategoriesFromCurrentTab()` gửi `SCAN_CATEGORIES_AT_INDEX` lên background.
+   - Background forward message sang **content script hls-demo** trên tab hiện tại:
+     - `scanXvideosCategories()` quét `#main-cats-sub-list li > a` → `{ url, label }[]`.
+   - Popup hiển thị danh sách category, cho tick `selected`, auto lưu vào `autoscanCategories` (storage.sync).
+2. Khi user bấm **“Bắt đầu scan & download”**:
+   - Popup đọc `minViews`, `maxViews` từ form, clamp:
+     - `minViewsClamped ∈ [1000, 1_000_000_000]`.
+     - `maxViewsClamped ∈ [minViewsClamped+1, 10_000_000_000]`.
+   - Gửi message:
+     - `START_CATEGORY_AUTOSCAN` với `{ categories: selected.map(c => c.url), minViews: minViewsClamped, maxViews: maxViewsClamped }`.
+3. Background nhận `START_CATEGORY_AUTOSCAN`:
+   - Lưu `autoscanMinViews = minViews`.
+   - `categoryQueue = [...selectedUrls]`, `currentCategoryUrl = categoryQueue.shift()`.
+   - `currentCategoryPageUrl = currentCategoryUrl`.
+   - Gọi `openOrReuseCategoryScanTab(currentCategoryPageUrl)`:
+     - Mở hoặc reuse một tab chuyên dùng cho autoscan (`categoryScanTabId`).
+4. `tabs.onUpdated` cho `categoryScanTabId` khi `status === "complete"`:
+   - Gửi message xuống content (hls-demo):
+     - `SCAN_CATEGORY_PAGE` với `{ minViews: autoscanMinViews, maxViews }`.
+5. Content script hls-demo:
+   - `scanXvideosCategoryListPage(minViews, maxViews)`:
+     - Quét `div.frame-block.thumb-block`.
+     - Parse views/duration.
+     - Giữ video thỏa **`views >= minViews && views < maxViews && durationMinutes <= 30`**.
+     - Trả về `{ videos: [{ url, thumbnailUrl, views, durationMinutes }...], hasHighVideos, nextPageUrl }`.
+6. Background nhận kết quả:
+   - Map `videos` thành `items: BatchItem[]` (url, thumbnailUrl).
+   - Gọi lại **/filter-source-urls** để tránh trùng giống như BATCH_QUEUE_URLS:
+     - `filteredUrls` → đưa vào **batchQueue** (merge, bỏ trùng).
+     - `updateUrls` → đưa vào **updateQueue** (merge, bỏ trùng), gọi `processUpdateQueue()`.
+   - Nếu `hasHighVideos === true` và có `nextPageUrl`:
+     - `currentCategoryPageUrl = nextPageUrl`, sau 3s gọi `openOrReuseCategoryScanTab(nextPageUrl)` để scan trang tiếp theo.
+   - Nếu không:
+     - Lấy tiếp `currentCategoryUrl = categoryQueue.shift()`; nếu còn → tiếp tục; nếu hết → `categoryScanTabId = null`.
+
+> Lưu ý: bấm nút **“Bắt đầu scan & download”** lần nữa sẽ **reset lại** `categoryQueue`, `autoscanMinViews` và bắt đầu autoscan lại với cấu hình mới (không có cờ “đang chạy” để chặn).
+
+### 5.3. Mở tab và trigger tải (batch download)
 
 1. **processBatchQueue()**: Trong khi `batchQueue.length > 0` và `batchTabIds.size < maxParallelDownloadTabs`:
    - shift một **item** (url, thumbnailUrl).
@@ -158,7 +212,7 @@ Tài liệu kỹ thuật mô tả luồng xử lý, message passing và state tr
 7. Nếu lỗi “thiếu dữ liệu” (HLS_DOWNLOAD_READY nhưng chunk thiếu): content gửi **BATCH_DONE** (trước alert); background đóng tab và processBatchQueue().
 8. Nếu downloadHls throw (catch): background cũng đóng tab batch và processBatchQueue().
 
-### 5.3. Cập nhật metadata (update queue)
+### 5.4. Cập nhật metadata (update queue)
 
 1. **processUpdateQueue()**: Lấy item từ updateQueue, **tabs.create({ url })**, đưa tabId vào updateTabIds, updatePendingTrigger, updateTabIdToItem.set(tabId, item).
 2. **tabs.onUpdated**(tabId, complete) và tabId trong **updatePendingTrigger** → sau ~3s gửi **TRIGGER_UPDATE_METADATA** (tabId) xuống tab.
@@ -211,10 +265,26 @@ Tài liệu kỹ thuật mô tả luồng xử lý, message passing và state tr
 
 ## 8. Popup
 
-- **loadConfig**: storage.sync lấy maxParallelDownloadTabs, segmentFetchConcurrency, autoTriggerDelaySec → hiển thị và cho sửa.
-- **saveConfig**: Ghi lại storage.sync (Background lắng storage.onChanged để cập nhật CONFIG).
-- **fetchQueueCount**: Gửi GET_BATCH_QUEUE_COUNT → hiển thị "Hàng đợi: X video"; setInterval 1.5s khi popup mở, clear khi đóng.
+- **loadConfig**:
+  - storage.sync lấy `maxParallelDownloadTabs`, `segmentFetchConcurrency`, `autoTriggerDelaySec`.
+  - Đọc thêm `minViewsForAutoDownload`, `maxViewsForAutoDownload` để prefill form min/max views.
+  - Đọc `autoscanCategories` để hiển thị danh sách category đã lưu (url, label, selected).
+- **saveConfig**:
+  - Ghi lại `maxParallelDownloadTabs`, `segmentFetchConcurrency`, `autoTriggerDelaySec`, `minViewsForAutoDownload`, `maxViewsForAutoDownload` vào storage.sync.
+  - Background lắng `storage.onChanged` để cập nhật `CONFIG`.
+- **fetchQueueCount**:
+  - Gửi `GET_BATCH_QUEUE_COUNT` → hiển thị "Hàng đợi: X video"; `setInterval` 1.5s khi popup mở, `clearInterval` khi đóng.
+- **Quét chuyên mục (xvideos)**:
+  - `scanCategoriesFromCurrentTab()`:
+    - Lấy tab hiện tại, gửi `SCAN_CATEGORIES_AT_INDEX` lên background.
+    - Background forward sang content script hls-demo để quét `scanXvideosCategories()`.
+    - Nhận `{ categories }` và lưu `autoscanCategories` vào storage.sync (gồm cả cờ selected).
+- **Bắt đầu autoscan chuyên mục**:
+  - `startCategoryAutoscan()`:
+    - Lọc các category `selected === true`.
+    - Clamp `minViews`, `maxViews` rồi gửi `START_CATEGORY_AUTOSCAN` (kèm `categories`, `minViews`, `maxViews`) lên background.
+    - Background điều khiển toàn bộ vòng lặp autoscan + batch/update như mô tả ở mục 5.2.
 
 ---
 
-*Tài liệu này mô tả đúng logic trong code tại thời điểm viết; khi sửa code nên cập nhật lại FLOW-LOGIC.md cho đồng bộ.*
+*Tài liệu này mô tả đúng logic trong code tại thời điểm viết (bao gồm autoscan category với min/max views); khi sửa code nên cập nhật lại FLOW-LOGIC.md cho đồng bộ.*
