@@ -154,6 +154,14 @@ async function scanCategoriesFromCurrentTab() {
   }
 }
 
+function selectAllCategories(selected: boolean) {
+  if (!categories.value.length) return;
+  categories.value = categories.value.map((c) => ({
+    ...c,
+    selected,
+  }));
+}
+
 async function startCategoryAutoscan() {
   if (!categories.value.length) return;
   const selected = categories.value.filter((c) => c.selected);
@@ -344,6 +352,26 @@ onUnmounted(() => {
         </button>
 
         <div v-if="categories.length" class="category-list">
+          <div class="category-list-header">
+            <span class="category-list-title">Danh sách chuyên mục</span>
+            <div class="category-list-actions">
+              <button
+                type="button"
+                class="small-btn"
+                @click="selectAllCategories(true)"
+              >
+                Chọn tất cả
+              </button>
+              <button
+                type="button"
+                class="small-btn"
+                @click="selectAllCategories(false)"
+              >
+                Bỏ chọn tất cả
+              </button>
+            </div>
+          </div>
+
           <label
             v-for="cat in categories"
             :key="cat.url"
@@ -443,6 +471,34 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+.category-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+
+.category-list-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.small-btn {
+  padding: 2px 6px;
+  font-size: 11px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  background: rgba(255, 255, 255, 0.06);
+  color: inherit;
+  cursor: pointer;
+}
+
+.small-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .category-item {
